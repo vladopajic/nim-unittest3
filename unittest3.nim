@@ -1,4 +1,4 @@
-# unittest2
+# unittest3
 #
 #        (c) Copyright 2015 Nim Contributors
 #        (c) Copyright 2019-2021 Ștefan Talpalaru
@@ -65,10 +65,10 @@
 ## --xml:file         Write JUnit-compatible XML report to `file`
 ## --console          Write report to the console (default, when no other output
 ##                    is selected)
-## --output-lvl:level Verbosity of output [COMPACT, VERBOSE, FAILURES, NONE] (env: UNITTEST2_OUTPUT_LVL)
+## --output-lvl:level Verbosity of output [COMPACT, VERBOSE, FAILURES, NONE] (env: unittest3_OUTPUT_LVL)
 ## --verbose, -v      Shorthand for --output-lvl:VERBOSE
 ##
-## Command line parsing can be disabled with `-d:unittest2DisableParamFiltering`.
+## Command line parsing can be disabled with `-d:unittest3DisableParamFiltering`.
 ##
 ## Running tests in parallel
 ## =========================
@@ -109,8 +109,9 @@
 ##     suiteTeardown:
 ##       echo "suite teardown: run once after the tests"
 
-import std/[
-  macros, sequtils, sets, strutils, streams, tables, times, monotimes]
+import std/[macros, sequtils, sets, strutils, streams, tables]
+import chronos
+export chronos
 
 when defined(nimHasWarnBareExcept):
   # In unit tests, we want to at least attempt to catch Exception no matter its
@@ -133,47 +134,59 @@ type
 
 const
   outputLevelDefault = COMPACT
-  slowThreshold = initDuration(seconds = 5)
+  slowThreshold = 5.seconds
 
   # `unittest` compatibility
   nimUnittestOutputLevel {.strdefine.} = $outputLevelDefault
   nimUnittestColor {.strdefine.} = "auto" ## auto|on|off
   nimUnittestAbortOnError {.booldefine.} = false
 
-  # `unittest2` compile-time configuration options
-  unittest2DisableParamFiltering {.booldefine.} = false
+  # `unittest3` compile-time configuration options
+  unittest3DisableParamFiltering {.booldefine.} = false
     ## Disables automatic command line argument parsing - parsing is available
     ## via the `parseParameters` function instead
-  unittest2Compat {.booldefine.} = true # This will be disabled in the future
+  unittest3Compat {.booldefine.} = false
     ## Compatibility mode for `unittest` for easier porting and improved
     ## backwards compatibility - no stability guarantees
-  unittest2NoCollect {.booldefine.} = false
+  unittest3NoCollect {.booldefine.} = false
     ## Disable test collection mode where tests are enumerated before they are
     ## run - in particular, this affects the order in which tests and suites
     ## have their bodies evaluated and disables several features that require
     ## knowing how many tests will be executed - experimental feature
-  unittest2PreviewIsolate {.booldefine.} = false
+  unittest3PreviewIsolate {.booldefine.} = false
     ## Preview isolation mode where each test is run in a separate process - may
     ## be removed in the future
-  unittest2Static* {.booldefine.} = false
+  unittest3Static* {.booldefine.} = false
     ## Run tests at compile time as well - only a subset of functionality is
     ## enabled at compile-time meaning that tests must be written
     ## conservatively. `suite` features (`setup` etc) in particular are not
     ## supported.
-  unittest2ListTests* {.booldefine.} = false
+  unittest3ListTests* {.booldefine.} = false
     ## List tests at runtime without actually running them (useful for test runners)
+
+  unittest3LowWatermark* {.intdefine.} = 4
+    ## Minimum number of concurrent tests to keep in flight.
+    ## When in-flight count drops below this, new tests are started immediately.
+  unittest3HighWatermark* {.intdefine.} = 8
+    ## Maximum number of concurrent tests in flight.
+    ## New tests are not started until a running test completes.
+
+static:
+  doAssert unittest3LowWatermark <= unittest3HighWatermark,
+    "unittest3LowWatermark must be <= unittest3HighWatermark"
 
 when useTerminal:
   import std/terminal
 
+
 const
-  collect = (not unittest2NoCollect and not unittest2Compat) or unittest2PreviewIsolate or unittest2ListTests
-  autoParseArgs = not unittest2DisableParamFiltering
-  isolate = unittest2PreviewIsolate
+  collect = (not unittest3NoCollect and not unittest3Compat) or unittest3PreviewIsolate or unittest3ListTests
+  autoParseArgs = not unittest3DisableParamFiltering
+  isolate = unittest3PreviewIsolate
 
 when isolate:
   let
-    isolated = getEnv("UNITTEST2_ISOLATED") == "1"
+    isolated = getEnv("unittest3_ISOLATED") == "1"
       ## Test is running in the isolated environment
 
 from std/exitprocs import nil
@@ -188,7 +201,7 @@ type
   Test = object
     suiteName: string
     testName: string
-    impl: proc(suite, name: string): TestStatus
+    asyncImpl: proc(suite, name: string): Future[TestStatus]
     lineInfo: int
     filename: string
 
@@ -260,6 +273,12 @@ type
     suites: seq[JUnitSuite]
     currentSuite: int
 
+  AsyncTestContext = ref object
+    ## Per-test state for async execution. Avoids shared global `testStatus` /
+    ## `checkpoints` being corrupted when tests interleave at `await` points.
+    status: TestStatus
+    checkpoints: seq[string]
+
 # TODO these globals are threadvar so as to avoid gc-safety-issues - this should
 #      probably be resolved in a better way down the line specially since we
 #      don't support threads _really_
@@ -277,6 +296,10 @@ var
 
   currentSuite {.threadvar.}: string
   testStatus {.threadvar.}: TestStatus
+  currentAsyncCtx {.threadvar.}: AsyncTestContext
+    ## Points to the currently-executing async test's context. Nil outside async tests.
+    ## Because chronos is single-threaded cooperative, only one test runs between
+    ## await points, so this pointer is always valid for the active test.
 
 when collect:
   var
@@ -285,7 +308,7 @@ when collect:
 abortOnError = nimUnittestAbortOnError
 
 when declared(stdout):
-  if existsEnv("UNITTEST2_ABORT_ON_ERROR") or existsEnv("NIMTEST_ABORT_ON_ERROR"):
+  if existsEnv("unittest3_ABORT_ON_ERROR") or existsEnv("NIMTEST_ABORT_ON_ERROR"):
     abortOnError = true
 
 when collect:
@@ -376,7 +399,7 @@ proc defaultColorOutput(): bool =
   else: raiseAssert "Unrecognised nimUnittestColor setting: " & color
 
   when declared(stdout):
-    # TODO unittest2-equivalent color parsing
+    # TODO unittest3-equivalent color parsing
     if existsEnv("NIMTEST_COLOR"):
       let colorEnv = getEnv("NIMTEST_COLOR")
       if colorEnv == "never":
@@ -388,13 +411,13 @@ proc defaultColorOutput(): bool =
 
 proc defaultOutputLevel(): OutputLevel =
   when declared(stdout):
-    const levelEnv = "UNITTEST2_OUTPUT_LVL"
+    const levelEnv = "unittest3_OUTPUT_LVL"
     const nimtestEnv = "NIMTEST_OUTPUT_LVL"
     if existsEnv(levelEnv):
       try:
         parseEnum[OutputLevel](getEnv(levelEnv))
       except ValueError:
-        echo "Cannot parse UNITTEST2_OUTPUT_LVL: ", getEnv(levelEnv)
+        echo "Cannot parse unittest3_OUTPUT_LVL: ", getEnv(levelEnv)
         quit 1
     elif existsEnv(nimtestEnv):
       # std-compatible parsing and translation
@@ -424,7 +447,7 @@ func formatStatus(status: TestStatus): string =
 
 proc formatDuration(dur: Duration, aligned = true): string =
   let
-    seconds = dur.inMilliseconds.float / 1000.0
+    seconds = dur.nanoseconds.float / 1_000_000_000.0
     precision = max(3 - ($seconds.int).len, 1)
     str = formatFloat(seconds, ffDecimal, precision)
 
@@ -616,7 +639,7 @@ method suiteEnded*(formatter: ConsoleOutputFormatter) =
     return
 
   let
-    totalDur = formatter.results.foldl(a + b.duration, DurationZero)
+    totalDur = formatter.results.foldl(a + b.duration, 0.seconds)
     totalDurStr = formatDuration(totalDur, false)
 
   if formatter.outputLevel == OutputLevel.COMPACT:
@@ -751,8 +774,8 @@ method testEnded*(formatter: JUnitOutputFormatter, testResult: TestResult) =
 method suiteEnded*(formatter: JUnitOutputFormatter) =
   formatter.currentSuite = -1
 
-func toFloatSeconds(duration: Duration): float64 =
-  duration.inNanoseconds().float64 / 1_000_000_000.0
+func toFloatSeconds(d: Duration): float64 =
+  d.nanoseconds.float / 1_000_000_000.0
 
 proc writeTest(s: Stream, test: JUnitTest) {.raises: [CatchableError].} =
   let
@@ -1016,7 +1039,10 @@ template checkpoint*(msg: string) =
   else:
     bind checkpoints
 
-    checkpoints.add(msg)
+    if currentAsyncCtx != nil:
+      currentAsyncCtx.checkpoints.add(msg)
+    else:
+      checkpoints.add(msg)
     # TODO: add support for something like SCOPED_TRACE from Google Test
 
 template fail* =
@@ -1041,23 +1067,31 @@ template fail* =
         echo("\n")
     quit 1
   else:
-    testStatus = TestStatus.FAILED
+    if currentAsyncCtx != nil:
+      currentAsyncCtx.status = TestStatus.FAILED
+    else:
+      testStatus = TestStatus.FAILED
 
     exitProcs.setProgramResult(1)
 
     for formatter in formatters:
       let formatter = formatter # avoid lent iterator
+      let cp = if currentAsyncCtx != nil: currentAsyncCtx.checkpoints
+               else: checkpoints
       when declared(stackTrace):
         when stackTrace is string:
-          formatter.failureOccurred(checkpoints, stackTrace)
+          formatter.failureOccurred(cp, stackTrace)
         else:
-          formatter.failureOccurred(checkpoints, "")
+          formatter.failureOccurred(cp, "")
       else:
-        formatter.failureOccurred(checkpoints, "")
+        formatter.failureOccurred(cp, "")
 
     if abortOnError: quit(1)
 
-    checkpoints.reset()
+    if currentAsyncCtx != nil:
+      currentAsyncCtx.checkpoints.reset()
+    else:
+      checkpoints.reset()
 
 template skip* =
   ## Mark the test as skipped. Should be used directly
@@ -1076,82 +1110,56 @@ template skip* =
   else:
     bind checkpoints
 
-    testStatus = TestStatus.SKIPPED
-    checkpoints = @[]
-
-proc runDirect(test: Test) =
-  when not collect:
-    # In collection mode, we implicitly create a suite based on the module name
-    # and start it based on the test list but in non-collect mode, we have to
-    # emulate this with this hack
-    if currentSuite != test.suiteName:
-      if currentSuite.len > 0:
-        suiteEnded()
-      suiteStarted(test.suiteName)
-      currentSuite = test.suiteName
-
-  let startTime = getMonoTime()
-  testStarted(test.testName)
-
-  # TODO this annotation works around a limitation where we know that we only
-  #      call the callback from the main thread but the compiler doesn't -
-  #      when / if testing becomes multithreaded, this will need a proper
-  #      solution
-  {.gcsafe.}:
-    let
-      status = test.impl(test.suiteName, test.testName)
-      duration = getMonoTime() - startTime
-
-  testEnded(TestResult(
-    suiteName: test.suiteName,
-    testName: test.testName,
-    status: status,
-    duration: duration
-  ))
+    if currentAsyncCtx != nil:
+      currentAsyncCtx.status = TestStatus.SKIPPED
+      currentAsyncCtx.checkpoints = @[]
+    else:
+      testStatus = TestStatus.SKIPPED
+      checkpoints = @[]
 
 template runtimeTest*(nameParam: string, body: untyped) =
-  ## Similar to `test` but runs only at run time, no matter the `unittest2Static`
+  ## Similar to `test` but runs only at run time, no matter the `unittest3Static`
   ## setting
-  bind collect, runDirect, shouldRun, checkpoints
+  bind collect, shouldRun, checkpoints
 
-  proc runTest(suiteName, testName: string): TestStatus {.raises: [], gensym.} =
-    testStatus = TestStatus.OK
-    template testStatusIMPL: var TestStatus {.inject, used.} = testStatus
-    let suiteName {.inject, used.} = suiteName
-    let testName {.inject, used.} = testName
+  proc runTestAsync(asyncSuiteName, asyncTestName: string): Future[TestStatus] {.
+      async, gcsafe, gensym.} =
+    let ctx = AsyncTestContext(status: TestStatus.OK, checkpoints: @[])
+    {.cast(gcsafe).}:
+      currentAsyncCtx = ctx
 
-    template fail(prefix: string, eClass: string, e: auto): untyped =
-      let eName = "[" & $e.name & "]"
-      checkpoint(prefix & "Unhandled " & eClass & ": " & e.msg & " " & eName)
-      var stackTrace {.inject.} = e.getStackTrace()
-      fail()
+      let suiteName {.inject, used.} = asyncSuiteName
+      let testName {.inject, used.} = asyncTestName
+      template testStatusIMPL: var TestStatus {.inject, used.} = ctx.status
 
-    template failingOnExceptions(prefix: string, code: untyped): untyped =
-      when NimMajor>=2:
-        {.push warning[UnnamedBreak]:off.}
-      try:
-        block:
-          code
-      except CatchableError as e:
-        prefix.fail("error", e)
-      except Defect as e: # This may or may not work dependings on --panics
-        prefix.fail("defect", e)
-      except Exception as e:
-        prefix.fail("exception that may cause undefined behavior", e)
-      when NimMajor>=2:
-        {.pop.}
+      template fail(prefix: string, eClass: string, e: auto): untyped =
+        let eName = "[" & $e.name & "]"
+        checkpoint(prefix & "Unhandled " & eClass & ": " & e.msg & " " & eName)
+        var stackTrace {.inject.} = e.getStackTrace()
+        fail()
 
-    failingOnExceptions("[setup] "):
-      when declared(testSetupIMPLFlag): testSetupIMPL()
-      defer: failingOnExceptions("[teardown] "):
-        when declared(testTeardownIMPLFlag): testTeardownIMPL()
-      failingOnExceptions(""):
-        when not unittest2ListTests:
-          body
+      # Use the same failingOnExceptions pattern as the sync version so that
+      # {.inject.} variables from setup are visible in body and teardown.
+      template failAsyncOnExceptions(prefix: string, code: untyped): untyped =
+        when NimMajor >= 2: {.push warning[UnnamedBreak]: off.}
+        try:
+          block:
+            code
+        except CatchableError as e: prefix.fail("error", e)
+        except Defect as e:         prefix.fail("defect", e)
+        except Exception as e:      prefix.fail("exception that may cause undefined behavior", e)
+        when NimMajor >= 2: {.pop.}
 
-    checkpoints = @[]
+      failAsyncOnExceptions("[setup] "):
+        when declared(testSetupIMPLFlag): testSetupIMPL()
+        failAsyncOnExceptions(""):
+          when not unittest3ListTests:
+            body  # await is valid here; setup-injected vars are in scope
+        failAsyncOnExceptions("[teardown] "):
+          when declared(testTeardownIMPLFlag): testTeardownIMPL()
 
-    testStatus
+      currentAsyncCtx = nil
+    ctx.status
 
   let
     localSuiteName =
@@ -1167,9 +1175,9 @@ template runtimeTest*(nameParam: string, body: untyped) =
     let
       instance =
         Test(
-          testName: localTestName, 
-          suiteName: localSuiteName, 
-          impl: runTest,
+          testName: localTestName,
+          suiteName: localSuiteName,
+          asyncImpl: runTestAsync,
           lineInfo: instantiationInfo().line,
           filename: instantiationInfo().filename
         )
@@ -1180,7 +1188,7 @@ template runtimeTest*(nameParam: string, body: untyped) =
 
 template staticTest*(nameParam: string, body: untyped) =
   ## Similar to `test` but runs only at compiletime, no matter the
-  ## `unittest2Static` flag
+  ## `unittest3Static` flag
   static:
     block:
       echo "[Test   ] ", nameParam
@@ -1191,12 +1199,12 @@ template staticTest*(nameParam: string, body: untyped) =
 
 template dualTest*(nameParam: string, body: untyped) =
   ## Similar to `test` but run the test both compuletime and run time, no
-  ## matter the `unittest2Static` flag
+  ## matter the `unittest3Static` flag
   staticTest nameParam:
-    when not unittest2ListTests:
+    when not unittest3ListTests:
       body
   runtimeTest nameParam:
-    when not unittest2ListTests:
+    when not unittest3ListTests:
       body
 
 template test*(nameParam: string, body: untyped) =
@@ -1214,23 +1222,23 @@ template test*(nameParam: string, body: untyped) =
   ##
   ##  [OK] roses are red
   when nimvm:
-    when unittest2Static:
+    when unittest3Static:
       staticTest nameParam:
-        when not unittest2ListTests:
+        when not unittest3ListTests:
           body
   runtimeTest nameParam:
-    when not unittest2ListTests:
+    when not unittest3ListTests:
       body
 
 {.pop.} # raises: []
 
-iterator unittest2EvalOnceIter[T](x: T): auto =
+iterator unittest3EvalOnceIter[T](x: T): auto =
   yield x
-iterator unittest2EvalOnceIter[T](x: var T): var T =
+iterator unittest3EvalOnceIter[T](x: var T): var T =
   yield x
 
-template unittest2EvalOnce(name: untyped, param: typed, blk: untyped) =
-  for name in unittest2EvalOnceIter(param):
+template unittest3EvalOnce(name: untyped, param: typed, blk: untyped) =
+  for name in unittest3EvalOnceIter(param):
     blk
 
 macro check*(conditions: untyped): untyped =
@@ -1263,7 +1271,7 @@ macro check*(conditions: untyped): untyped =
     result.printOuts = newNimNode(nnkStmtList)
 
     var counter = 0
-    let evalOnce = bindSym("unittest2EvalOnce")
+    let evalOnce = bindSym("unittest3EvalOnce")
     result.frame = result.inner
     if exp[0].kind in {nnkIdent, nnkOpenSymChoice, nnkClosedSymChoice, nnkSym} and
         $exp[0] in ["not", "in", "notin", "==", "<=",
@@ -1407,10 +1415,10 @@ macro expect*(exceptions: varargs[typed], body: untyped): untyped =
   result = getAst(expectBody(errorTypes, errorTypes.lineInfo, body))
 
 proc disableParamFiltering* {.deprecated:
-    "Compile with -d:unittest2DisableParamFiltering instead".} =
+    "Compile with -d:unittest3DisableParamFiltering instead".} =
   discard
 
-when unittest2PreviewIsolate:
+when unittest3PreviewIsolate:
   import std/[osproc, strtabs]
   proc runIsolated(test: Test) =
     # Run test in an isolated process - this has the advantage that we can
@@ -1425,14 +1433,14 @@ when unittest2PreviewIsolate:
     # * simple to parallelise
     # * we can abort long-running tests after a timeout
 
-    let startTime = getMonoTime()
+    let startTime = Moment.now()
     testStarted(test.testName)
 
     let runner = startProcess(
       getAppFilename2(),
       args = [test.suiteName & "::" & test.testName],
       env = newStringTable(
-        "UNITTEST2_ISOLATED", "1",
+        "unittest3_ISOLATED", "1",
         StringTableMode.modeCaseSensitive),
       options = {poStdErrToStdOut})
 
@@ -1459,7 +1467,7 @@ when unittest2PreviewIsolate:
       suiteName: test.suiteName,
       testName: test.testName,
       status: if status == 0: TestStatus.OK else: TestStatus.FAILED,
-      duration: getMonoTime() - startTime,
+      duration: Moment.now() - startTime,
       output: output
     ))
 
@@ -1492,12 +1500,91 @@ when unittest2PreviewIsolate:
       echo("\n")
 
 when collect:
+  proc runAsync(test: Test) {.async.} =
+    let startTime = Moment.now()
+    testStarted(test.testName)
+    var status = TestStatus.FAILED
+    try:
+      {.cast(gcsafe).}:
+        status = await test.asyncImpl(test.suiteName, test.testName)
+    except Exception as e:
+      discard e  # asyncImpl catches all exceptions internally; status already set
+    
+    testEnded(TestResult(
+      suiteName: test.suiteName,
+      testName: test.testName,
+      status: status,
+      duration: Moment.now() - startTime
+    ))
+
+  proc runScheduledTestsAsync(
+      tmp: OrderedTable[string, seq[Test]]
+  ) {.async.} =
+    type InflightEntry = tuple[fut: FutureBase, suiteName: string]
+    var
+      allTests: seq[tuple[suiteName: string, test: Test]]
+      suiteTotals: Table[string, int]
+      suiteDone: Table[string, int]
+      suiteBegun: HashSet[string]
+      inflight: seq[InflightEntry]
+      idx = 0
+
+    for sn, suite in tmp:
+      if suite.len == 0: continue
+      suiteTotals[sn] = suite.len
+      for t in suite:
+        allTests.add((sn, t))
+
+    const LOW = unittest3LowWatermark
+    const HIGH = unittest3HighWatermark
+
+    while idx < allTests.len or inflight.len > 0:
+      # Reap completed futures; signal suiteEnded when last test of suite finishes
+      var nextInflight: seq[InflightEntry]
+      for entry in inflight:
+        if entry.fut.finished:
+          let done = suiteDone.getOrDefault(entry.suiteName, 0) + 1
+          suiteDone[entry.suiteName] = done
+          if done == suiteTotals.getOrDefault(entry.suiteName, 0):
+            suiteEnded()
+        else:
+          nextInflight.add(entry)
+      inflight = nextInflight
+
+      # Launch new tests up to HIGH watermark
+      while idx < allTests.len and inflight.len < HIGH:
+        let (sn, t) = allTests[idx]
+        if sn notin suiteBegun:
+          suiteStarted(sn)
+          suiteBegun.incl(sn)
+        inflight.add((FutureBase(runAsync(t)), sn))
+        inc idx
+
+      if inflight.len == 0:
+        break
+
+      if inflight.len >= HIGH or idx >= allTests.len:
+        # At capacity or all tests launched: wait for one to finish
+        try:
+          discard await chronos.race(inflight.mapIt(it.fut))
+        except ValueError:
+          discard  # inflight is non-empty so this should not fire
+        except CancelledError:
+          break
+      elif inflight.len >= LOW:
+        # Enough tests running: yield briefly to let blocked tests progress
+        try:
+          await chronos.sleepAsync(chronos.ZeroDuration)
+        except CancelledError:
+          break
+      # else: inflight < LOW — keep filling without yielding
+
   proc runScheduledTests() {.noconv.} =
     # Tests can be added inside tests - this is weird and only partially
     # supported
     while tests.len > 0:
       var tmp = move(tests)
-      when unittest2ListTests:
+      when unittest3ListTests:
         for suiteName, suite in tmp:
           if suite.len == 0: continue
           echo "Suite: ", suiteName
@@ -1506,23 +1593,20 @@ when collect:
             echo "\tFile: ", test.filename, ":", test.lineInfo
       else:
         suiteRunStarted(tmp)
-        for suiteName, suite in tmp:
-          if suite.len == 0: continue
-
-          suiteStarted(suiteName)
-          for test in suite:
-            when isolate:
+        when isolate:
+          for suiteName, suite in tmp:
+            if suite.len == 0: continue
+            suiteStarted(suiteName)
+            for test in suite:
               if not isolated:
                 runIsolated(test)
               else:
                 runDirect(test)
-            else:
-              runDirect(test)
-
-          suiteEnded()
-
+            suiteEnded()
+        else:
+          waitFor(runScheduledTestsAsync(tmp))
         suiteRunEnded()
-    when not unittest2ListTests:
+    when not unittest3ListTests:
       testRunEnded()
 
   addExitProc(runScheduledTests)

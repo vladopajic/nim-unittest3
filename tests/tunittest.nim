@@ -20,7 +20,7 @@ discard """
 '''
 """
 
-import ../unittest2, sequtils
+import ../unittest3, sequtils
 from std/exitprocs import nil
 import std/[osproc, strutils]
 
@@ -277,9 +277,9 @@ suite "break should works inside test body":
     check number == 2
 
 suite "list tests":
-  test "should list tests when `-d:unittest2ListTests` is passed":    
+  test "should list tests when `-d:unittest3ListTests` is passed":    
 
-    let (output, exitCode) = execCmdEx("nim c -d:unittest2ListTests -r tests/sampletests.nim")
+    let (output, exitCode) = execCmdEx("nim c -d:unittest3ListTests -r tests/sampletests.nim")
     
     check exitCode == 0
     check count(output, "Suite:") == 3

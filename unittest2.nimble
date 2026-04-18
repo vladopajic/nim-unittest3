@@ -1,7 +1,9 @@
 mode = ScriptMode.Verbose
 
-version       = "0.2.5"
-author        = "Status Research & Development GmbH"
-description   = "unittest fork with support for parallel test execution"
+version       = "0.0.1"
+author        = "@vladopajic"
+description   = "unittest3"
 license       = "MIT"
-requires "nim >= 1.6.0"
+
+requires "nim >= 2.0.0"
+requires "chronos >= 4.0.0 & < 5.0.0"

@@ -1,4 +1,4 @@
-import ../unittest2
+import ../unittest3
 
 suite "Sample Tests":
   test "Sample Test":

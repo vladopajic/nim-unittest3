@@ -28,7 +28,7 @@ proc testOptions() =
   rmFile xmlFile
 
   # This should not, since we disable param processing.
-  run("-d:unittest2DisableParamFiltering", "tests/tunittest", "--xml:" & xmlFile)
+  run("-d:unittest3DisableParamFiltering", "tests/tunittest", "--xml:" & xmlFile)
   doAssert not fileExists xmlFile
 
 task test, "Run tests":
@@ -38,7 +38,7 @@ task test, "Run tests":
   for f in listFiles("tests"):
     if not (f.len > 4 and f[^4..^1] == ".nim"): continue
 
-    for compat in ["-d:unittest2Compat=false", "-d:unittest2Compat=true"]:
+    for compat in ["-d:unittest3Compat=false", "-d:unittest3Compat=true"]:
       for color in ["-d:nimUnittestColor=on", "-d:nimUnittestColor=off"]:
         for level in ["VERBOSE", "COMPACT", "FAILURES", "NONE"]:
           run "--threads:on " & " " & compat & " " & color, f, "--output-level=" & level
@@ -46,4 +46,8 @@ task test, "Run tests":
   testOptions()
 
 task buildDocs, "Build docs":
-  exec "nim doc --skipParentCfg:on --skipUserCfg:on --outdir:docs --git.url:https://github.com/status-im/nim-unittest2 --git.commit:master --git.devel:master unittest2.nim"
+  exec "nim doc --skipParentCfg:on --skipUserCfg:on --outdir:docs --git.url:https://github.com/status-im/nim-unittest3 --git.commit:master --git.devel:master unittest3.nim"
+# begin Nimble config (version 2)
+when withDir(thisDir(), system.fileExists("nimble.paths")):
+  include "nimble.paths"
+# end Nimble config
