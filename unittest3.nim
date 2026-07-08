@@ -161,11 +161,6 @@ const
   unittest3PreviewIsolate {.booldefine.} = false
     ## Preview isolation mode where each test is run in a separate process - may
     ## be removed in the future
-  unittest3Static* {.booldefine.} = false
-    ## Run tests at compile time as well - only a subset of functionality is
-    ## enabled at compile-time meaning that tests must be written
-    ## conservatively. `suite` features (`setup` etc) in particular are not
-    ## supported.
   unittest3ListTests* {.booldefine.} = false
     ## List tests at runtime without actually running them (useful for test runners)
 
@@ -301,7 +296,6 @@ var
     ## immediately on fail. Default is false,
     ## or override with `-d:nimUnittestAbortOnError:on|off`.
 
-  checkpointsVm {.compileTime.}: seq[string]
   checkpoints {.threadvar.}: seq[string]
   formatters {.threadvar.}: seq[OutputFormatter]
   testsFilters {.threadvar.}: HashSet[string]
@@ -1086,17 +1080,14 @@ when defined(testing): export matchFilter
 proc shouldRun(currentSuiteName, testName: string): bool =
   ## Check if a test should be run by matching suiteName and testName against
   ## test filters.
-  when nimvm:
-    true
-  else:
-    if testsFilters.len == 0:
+  if testsFilters.len == 0:
+    return true
+
+  for f in testsFilters:
+    if matchFilter(currentSuiteName, testName, f):
       return true
 
-    for f in testsFilters:
-      if matchFilter(currentSuiteName, testName, f):
-        return true
-
-    return false
+  return false
 
 proc parseParameters*(args: openArray[string]) =
   var
@@ -1189,18 +1180,15 @@ template suite*(nameParam: string, body: untyped) {.dirty.} =
       var testSuiteTeardownIMPLFlag {.used.} = true
       template testSuiteTeardownIMPL: untyped {.dirty.} = suiteTeardownBody
 
-    when nimvm:
-      discard
-    else:
-      let suiteName {.inject.} = nameParam
-      when not collect:
-        # TODO deal with suite nesting
-        if currentSuite.len > 0:
-          suiteEnded()
-          currentSuite.reset()
-        currentSuite = suiteName
+    let suiteName {.inject.} = nameParam
+    when not collect:
+      # TODO deal with suite nesting
+      if currentSuite.len > 0:
+        suiteEnded()
+        currentSuite.reset()
+      currentSuite = suiteName
 
-        suiteStarted(suiteName)
+      suiteStarted(suiteName)
 
     # TODO what about exceptions in the suite itself?
     body
@@ -1208,12 +1196,9 @@ template suite*(nameParam: string, body: untyped) {.dirty.} =
     when declared(testSuiteTeardownIMPLFlag):
       testSuiteTeardownIMPL()
 
-    when nimvm:
-      discard
-    else:
-      when not collect:
-        suiteEnded()
-        currentSuite.reset()
+    when not collect:
+      suiteEnded()
+      currentSuite.reset()
 
 template checkpoint*(msg: string) =
   ## Set a checkpoint identified by `msg`. Upon test failure all
@@ -1226,17 +1211,13 @@ template checkpoint*(msg: string) =
   ##  checkpoint("Checkpoint B")
   ##
   ## outputs "Checkpoint A" once it fails.
-  when nimvm:
-    {.cast(gcsafe).}:
-      checkpointsVm.add msg
-  else:
-    bind checkpoints
+  bind checkpoints
 
-    if currentAsyncCtx != nil:
-      currentAsyncCtx.checkpoints.add(msg)
-    else:
-      checkpoints.add(msg)
-    # TODO: add support for something like SCOPED_TRACE from Google Test
+  if currentAsyncCtx != nil:
+    currentAsyncCtx.checkpoints.add(msg)
+  else:
+    checkpoints.add(msg)
+  # TODO: add support for something like SCOPED_TRACE from Google Test
 
 template fail* =
   ## Print out the checkpoints encountered so far and quit if ``abortOnError``
@@ -1251,40 +1232,31 @@ template fail* =
   ##  fail()
   ##
   ## outputs "Checkpoint A" before quitting.
-  when nimvm:
-    echo "Tests failed"
-    {.cast(gcsafe).}:
-      for msg in items(checkpointsVm):
-        echo("    ")
-        echo(msg)
-        echo("\n")
-    quit 1
+  if currentAsyncCtx != nil:
+    currentAsyncCtx.status = TestStatus.FAILED
   else:
-    if currentAsyncCtx != nil:
-      currentAsyncCtx.status = TestStatus.FAILED
-    else:
-      testStatus = TestStatus.FAILED
+    testStatus = TestStatus.FAILED
 
-    exitProcs.setProgramResult(1)
+  exitProcs.setProgramResult(1)
 
-    for formatter in formatters:
-      let formatter = formatter # avoid lent iterator
-      let cp = if currentAsyncCtx != nil: currentAsyncCtx.checkpoints
-               else: checkpoints
-      when declared(stackTrace):
-        when stackTrace is string:
-          formatter.failureOccurred(cp, stackTrace)
-        else:
-          formatter.failureOccurred(cp, "")
+  for formatter in formatters:
+    let formatter = formatter # avoid lent iterator
+    let cp = if currentAsyncCtx != nil: currentAsyncCtx.checkpoints
+             else: checkpoints
+    when declared(stackTrace):
+      when stackTrace is string:
+        formatter.failureOccurred(cp, stackTrace)
       else:
         formatter.failureOccurred(cp, "")
-
-    if abortOnError: quit(1)
-
-    if currentAsyncCtx != nil:
-      currentAsyncCtx.checkpoints.reset()
     else:
-      checkpoints.reset()
+      formatter.failureOccurred(cp, "")
+
+  if abortOnError: quit(1)
+
+  if currentAsyncCtx != nil:
+    currentAsyncCtx.checkpoints.reset()
+  else:
+    checkpoints.reset()
 
 template skip* =
   ## Mark the test as skipped. Should be used directly
@@ -1297,22 +1269,17 @@ template skip* =
   ##
   ##  if not isGLContextCreated():
   ##    skip()
-  when nimvm:
-    {.cast(gcsafe).}:
-      reset checkpointsVm
-  else:
-    bind checkpoints
+  bind checkpoints
 
-    if currentAsyncCtx != nil:
-      currentAsyncCtx.status = TestStatus.SKIPPED
-      currentAsyncCtx.checkpoints = @[]
-    else:
-      testStatus = TestStatus.SKIPPED
-      checkpoints = @[]
+  if currentAsyncCtx != nil:
+    currentAsyncCtx.status = TestStatus.SKIPPED
+    currentAsyncCtx.checkpoints = @[]
+  else:
+    testStatus = TestStatus.SKIPPED
+    checkpoints = @[]
 
 template runtimeTest*(nameParam: string, body: untyped) =
-  ## Similar to `test` but runs only at run time, no matter the `unittest3Static`
-  ## setting
+  ## Similar to `test`, but always runs at runtime.
   bind collect, shouldRun, checkpoints
 
   proc runTestAsync(asyncSuiteName, asyncTestName: string): Future[TestRunResult] {.
@@ -1382,27 +1349,6 @@ template runtimeTest*(nameParam: string, body: untyped) =
     else:
       runDirect(instance)
 
-template staticTest*(nameParam: string, body: untyped) =
-  ## Similar to `test` but runs only at compiletime, no matter the
-  ## `unittest3Static` flag
-  static:
-    block:
-      echo "[Test   ] ", nameParam
-      body
-      echo "[", TestStatus.OK, "     ] ", nameParam
-    {.cast(gcsafe).}:
-      reset checkpointsVm
-
-template dualTest*(nameParam: string, body: untyped) =
-  ## Similar to `test` but run the test both compuletime and run time, no
-  ## matter the `unittest3Static` flag
-  staticTest nameParam:
-    when not unittest3ListTests:
-      body
-  runtimeTest nameParam:
-    when not unittest3ListTests:
-      body
-
 template test*(nameParam: string, body: untyped) =
   ## Define a single test case identified by `name`.
   ##
@@ -1417,11 +1363,6 @@ template test*(nameParam: string, body: untyped) =
   ## .. code-block::
   ##
   ##  [OK] roses are red
-  when nimvm:
-    when unittest3Static:
-      staticTest nameParam:
-        when not unittest3ListTests:
-          body
   runtimeTest nameParam:
     when not unittest3ListTests:
       body
@@ -1561,14 +1502,11 @@ template require*(conditions: untyped) =
   ## Same as `check` except any failed test causes the program to quit
   ## immediately. Any teardown statements are not executed and the failed
   ## test output is not generated.
-  when nimvm:
+  let savedAbortOnError = abortOnError
+  block:
+    abortOnError = true
     check conditions
-  else:
-    let savedAbortOnError = abortOnError
-    block:
-      abortOnError = true
-      check conditions
-    abortOnError = savedAbortOnError
+  abortOnError = savedAbortOnError
 
 macro expect*(exceptions: varargs[typed], body: untyped): untyped =
   ## Test if `body` raises an exception found in the passed `exceptions`.
