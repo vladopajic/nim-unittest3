@@ -11,7 +11,11 @@ jobs:
     uses: status-im/nimbus-common-workflow/.github/workflows/common.yml@main
     with:
       test-command: |
-        env TEST_LANG="c" NIMFLAGS="${NIMFLAGS} --mm:refc" nim test
-        env TEST_LANG="cpp" NIMFLAGS="${NIMFLAGS} --mm:refc" nim test
-        env TEST_LANG="c" NIMFLAGS="${NIMFLAGS} --mm:orc" nim test
-        env TEST_LANG="cpp" NIMFLAGS="${NIMFLAGS} --mm:orc" nim test
+        env TEST_LANG="c" NIMFLAGS="${NIMFLAGS} --mm:refc" nim c ./tests/test_all
+        ./tests/test_all
+        env TEST_LANG="cpp" NIMFLAGS="${NIMFLAGS} --mm:refc" nim c ./tests/test_all
+        ./tests/test_all
+        env TEST_LANG="c" NIMFLAGS="${NIMFLAGS} --mm:orc" nim c ./tests/test_all
+        ./tests/test_all
+        env TEST_LANG="cpp" NIMFLAGS="${NIMFLAGS} --mm:orc" nim c ./tests/test_all
+        ./tests/test_all
