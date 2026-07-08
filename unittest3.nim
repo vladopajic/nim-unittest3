@@ -32,15 +32,16 @@ when declared(stdout) and defined(posix):
 const useTerminal = declared(stdout) and not defined(js)
 
 type
-  OutputLevel* = enum  ## The output verbosity of the tests.
-    VERBOSE,     ## Print as much as possible.
-    COMPACT      ## Print failures and compact success information
-    FAILURES,    ## Print only failures
-    NONE         ## Print nothing.
+  OutputLevel* = enum ## The output verbosity of the tests.
+    VERBOSE,          ## Print as much as possible.
+    COMPACT           ## Print failures and compact success information
+    FAILURES,         ## Print only failures
+    NONE              ## Print nothing.
 
 const
   outputLevelDefault = COMPACT
   slowThreshold = 5.seconds
+  defaultJobs = 8
 
   # `unittest` compatibility
   nimUnittestOutputLevel {.strdefine.} = $outputLevelDefault
@@ -65,19 +66,11 @@ const
   unittest3ListTests* {.booldefine.} = false
     ## List tests at runtime without actually running them (useful for test runners)
 
-  unittest3LowWatermark* {.intdefine.} = 4
-    ## Minimum number of concurrent tests to keep in flight.
-    ## When in-flight count drops below this, new tests are started immediately.
-  unittest3HighWatermark* {.intdefine.} = 8
-    ## Maximum number of concurrent tests in flight.
-    ## New tests are not started until a running test completes.
   unittest3TestTimeoutSeconds* {.intdefine.} = 60
     ## Maximum duration for a single test.
     ## Set to 0 to disable per-test timeout enforcement.
 
 static:
-  doAssert unittest3LowWatermark <= unittest3HighWatermark,
-    "unittest3LowWatermark must be <= unittest3HighWatermark"
   doAssert unittest3TestTimeoutSeconds >= 0,
     "unittest3TestTimeoutSeconds must be >= 0"
 
@@ -86,7 +79,8 @@ when useTerminal:
 
 
 const
-  collect = (not unittest3NoCollect and not unittest3Compat) or unittest3PreviewIsolate or unittest3ListTests
+  collect = (not unittest3NoCollect and not unittest3Compat) or
+      unittest3PreviewIsolate or unittest3ListTests
   autoParseArgs = not unittest3DisableParamFiltering
   isolate = unittest3PreviewIsolate
 
@@ -110,6 +104,7 @@ type
     asyncImpl: proc(suite, name: string): Future[TestRunResult]
     lineInfo: int
     filename: string
+    serial: bool
 
   TestStatus* = enum ## The status of a test when it is done.
     OK,
@@ -208,8 +203,11 @@ var
   checkpoints {.threadvar.}: seq[string]
   formatters {.threadvar.}: seq[OutputFormatter]
   testsFilters {.threadvar.}: HashSet[string]
+  runtimeJobs {.threadvar.}: int
 
   currentSuite {.threadvar.}: string
+  currentSuiteSerial {.threadvar.}: bool
+  currentTestSerial {.threadvar.}: bool
   testStatus {.threadvar.}: TestStatus
   currentAsyncCtx {.threadvar.}: AsyncTestContext
     ## Points to the currently-executing async test's context. Nil outside async tests.
@@ -340,13 +338,17 @@ template installChroniclesTestOutput() {.dirty.} =
   bind chroniclesTestOutputWriter
   mixin defaultChroniclesStream
   when declared(defaultChroniclesStream):
-    when compiles(defaultChroniclesStream.outputs[0].writer = chroniclesTestOutputWriter):
+    when compiles(defaultChroniclesStream.outputs[
+        0].writer = chroniclesTestOutputWriter):
       defaultChroniclesStream.outputs[0].writer = chroniclesTestOutputWriter
-    when compiles(defaultChroniclesStream.outputs[1].writer = chroniclesTestOutputWriter):
+    when compiles(defaultChroniclesStream.outputs[
+        1].writer = chroniclesTestOutputWriter):
       defaultChroniclesStream.outputs[1].writer = chroniclesTestOutputWriter
-    when compiles(defaultChroniclesStream.outputs[2].writer = chroniclesTestOutputWriter):
+    when compiles(defaultChroniclesStream.outputs[
+        2].writer = chroniclesTestOutputWriter):
       defaultChroniclesStream.outputs[2].writer = chroniclesTestOutputWriter
-    when compiles(defaultChroniclesStream.outputs[3].writer = chroniclesTestOutputWriter):
+    when compiles(defaultChroniclesStream.outputs[
+        3].writer = chroniclesTestOutputWriter):
       defaultChroniclesStream.outputs[3].writer = chroniclesTestOutputWriter
 
 proc noteTestExecution(suiteName, testName: string) {.gcsafe.}
@@ -401,7 +403,8 @@ when declared(stdout):
 
 when collect:
   method suiteRunStarted*(
-      formatter: OutputFormatter, tests: OrderedTable[string, seq[Test]]) {.base, gcsafe.} =
+      formatter: OutputFormatter, tests: OrderedTable[string, seq[
+          Test]]) {.base, gcsafe.} =
     # Run when a round of running discovered suites starts - these may result
     # in subsequent tests being added meaning subsequent suite runs
     discard
@@ -602,14 +605,16 @@ method suiteStarted*(formatter: ConsoleOutputFormatter, suiteName: string) =
       when collect: formatFraction(formatter.curSuite, formatter.tests.len) & " "
       else:
         if formatter.outputLevel == VERBOSE: formatStatus("Suite") & " " else: ""
-    maxNameLen = when collect: max(toSeq(formatter.tests.keys()).mapIt(it.len)) else: 0
+    maxNameLen = when collect: max(toSeq(formatter.tests.keys()).mapIt(
+        it.len)) else: 0
     eol = if formatter.outputLevel == VERBOSE: "\n" else: " "
   if formatter.outputLevel == COMPACT and formatter.compactLineOpen:
     echo ""
     formatter.compactLineOpen = false
 
   formatter.write do:
-    stdout.styledWrite(styleBright, fgBlue, counter, alignLeft(suiteName, maxNameLen), eol)
+    stdout.styledWrite(styleBright, fgBlue, counter, alignLeft(suiteName,
+        maxNameLen), eol)
   do:
     stdout.write(counter, alignLeft(suiteName, maxNameLen), eol)
   stdout.flushFile()
@@ -635,13 +640,15 @@ method testStarted*(formatter: ConsoleOutputFormatter, testName: string) =
   let
     counter =
       when collect:
-        try: formatFraction(formatter.curTest, formatter.tests[formatter.curSuiteName]) & " "
+        try: formatFraction(formatter.curTest, formatter.tests[
+            formatter.curSuiteName]) & " "
         except CatchableError: ""
       else:
         formatStatus("Test")
 
   formatter.write do:
-    stdout.styledWrite "  ", fgBlue, alignLeft(counter, maxStatusLen + maxDurationLen + 7)
+    stdout.styledWrite "  ", fgBlue, alignLeft(counter, maxStatusLen +
+        maxDurationLen + 7)
   do:
     stdout.write "  ", alignLeft(counter, maxStatusLen + maxDurationLen + 7)
 
@@ -691,10 +698,12 @@ proc getAppFilename2(): string =
   except OSError:
     ""
 
-proc printFailureInfo(formatter: ConsoleOutputFormatter, testResult: TestResult) =
+proc printFailureInfo(formatter: ConsoleOutputFormatter,
+    testResult: TestResult) =
   # Show how to re-run this test case
   echo repeat('=', testResult.testName.len)
-  echo "  ", getAppFilename2(), " ", quoteShell(testResult.suiteName & "::" & testResult.testName)
+  echo "  ", getAppFilename2(), " ", quoteShell(testResult.suiteName & "::" &
+      testResult.testName)
   echo repeat('-', testResult.testName.len)
 
   # Show the output
@@ -719,7 +728,8 @@ proc printCapturedOutput(formatter: ConsoleOutputFormatter, output: string) =
   except CatchableError:
     discard
 
-proc printTestResultStatus(formatter: ConsoleOutputFormatter, testResult: TestResult) =
+proc printTestResultStatus(formatter: ConsoleOutputFormatter,
+    testResult: TestResult) =
   let
     status = formatStatus(testResult.status)
     duration = formatDuration(testResult.duration)
@@ -752,7 +762,8 @@ method testEnded*(formatter: ConsoleOutputFormatter, testResult: TestResult) =
 
   formatter.results.add(testResult)
 
-  if formatter.outputLevel == VERBOSE and testResult.status == TestStatus.FAILED:
+  if formatter.outputLevel == VERBOSE and testResult.status ==
+      TestStatus.FAILED:
     # We'll print it again when all tests have completed
     formatter.failures.add testResult
 
@@ -761,7 +772,8 @@ method testEnded*(formatter: ConsoleOutputFormatter, testResult: TestResult) =
       printFailureInfo(formatter, testResult)
     elif formatter.outputLevel == VERBOSE:
       formatter.printCapturedOutput(testResult.output)
-    if formatter.outputLevel == VERBOSE or testResult.status == TestStatus.FAILED:
+    if formatter.outputLevel == VERBOSE or testResult.status ==
+        TestStatus.FAILED:
       printTestResultStatus(formatter, testResult)
   else:
     # In compact mode, we use a small marker to mark progress within the suite -
@@ -775,7 +787,7 @@ method testEnded*(formatter: ConsoleOutputFormatter, testResult: TestResult) =
       marker = testResult.status.marker()
       color = testResult.status.color()
     formatter.write do:
-        stdout.styledWrite styleBright, color, marker
+      stdout.styledWrite styleBright, color, marker
     do:
       stdout.write marker
     stdout.flushFile()
@@ -983,7 +995,7 @@ method testRunEnded*(formatter: JUnitOutputFormatter) =
   let s = formatter.stream
 
   when defined(nimHasWarnBareExcept):
-    {.warning[BareExcept]:off.}
+    {.warning[BareExcept]: off.}
   try:
     s.writeLine("<testsuites>")
 
@@ -1000,7 +1012,7 @@ method testRunEnded*(formatter: JUnitOutputFormatter) =
     quit 1
 
   when defined(nimHasWarnBareExcept):
-    {.warning[BareExcept]:on.}
+    {.warning[BareExcept]: on.}
 
 proc glob(matcher, filter: string): bool =
   ## Globbing using a single `*`. Empty `filter` matches everything.
@@ -1010,13 +1022,13 @@ proc glob(matcher, filter: string): bool =
   if not filter.contains('*'):
     return matcher == filter
 
-  let beforeAndAfter = filter.split('*', maxsplit=1)
+  let beforeAndAfter = filter.split('*', maxsplit = 1)
   if beforeAndAfter.len == 1:
     # "foo*"
     return matcher.startsWith(beforeAndAfter[0])
 
   if matcher.len < filter.len - 1:
-    return false  # "12345" should not match "123*345"
+    return false # "12345" should not match "123*345"
 
   return matcher.startsWith(beforeAndAfter[0]) and matcher.endsWith(
       beforeAndAfter[1])
@@ -1027,7 +1039,7 @@ proc matchFilter(suiteName, testName, filter: string): bool =
   if testName == filter:
     # corner case for tests containing "::" in their name
     return true
-  let suiteAndTestFilters = filter.split("::", maxsplit=1)
+  let suiteAndTestFilters = filter.split("::", maxsplit = 1)
 
   if suiteAndTestFilters.len == 1:
     # no suite specified
@@ -1051,6 +1063,29 @@ proc shouldRun(currentSuiteName, testName: string): bool =
 
   return false
 
+proc parseJobs(value, source: string): int =
+  try:
+    result = parseInt(value)
+  except ValueError:
+    echo "Cannot parse ", source, ": ", value
+    quit 1
+  if result <= 0:
+    echo source, " must be greater than 0"
+    quit 1
+
+proc initRuntimeJobs() =
+  runtimeJobs = defaultJobs
+  when declared(stdout):
+    const jobsEnv = "UNITTEST3_JOBS"
+    if existsEnv(jobsEnv):
+      runtimeJobs = parseJobs(getEnv(jobsEnv), jobsEnv)
+
+proc getRuntimeJobs(): int =
+  if runtimeJobs <= 0:
+    defaultJobs
+  else:
+    runtimeJobs
+
 proc parseParameters*(args: openArray[string]) =
   var
     hasConsole = false
@@ -1061,12 +1096,14 @@ proc parseParameters*(args: openArray[string]) =
   # Read tests to run from the command line.
   for str in args:
     if str.startsWith("--help"):
-      echo "Usage: [--xml=file.xml] [--console] [--output-level=[VERBOSE,COMPACT,FAILURES,NONE]] [test-name-glob]"
+      echo "Usage: [--xml=file.xml] [--console] [--output-level=[VERBOSE,COMPACT,FAILURES,NONE]] [--jobs=N] [test-name-glob]"
       quit 0
     elif str.startsWith("--xml:") or str.startsWith("--xml="):
       hasXml = str[("--xml".len + 1)..^1] # skip separator char as well
     elif str.startsWith("--console"):
       hasConsole = true
+    elif str.startsWith("--jobs:") or str.startsWith("--jobs="):
+      runtimeJobs = parseJobs(str[("--jobs".len + 1)..^1], "--jobs")
     elif str.startsWith("--output-level:") or str.startsWith("--output-level="):
       hasLevel = try: parseEnum[OutputLevel](str[("--output-level".len + 1)..^1])
         except ValueError:
@@ -1090,6 +1127,8 @@ proc parseParameters*(args: openArray[string]) =
     formatters.add(newConsoleOutputFormatter(level, defaultColorOutput()))
 
 proc ensureInitialized() =
+  initRuntimeJobs()
+
   if autoParseArgs and declared(paramCount):
     parseParameters(commandLineParams())
 
@@ -1244,7 +1283,8 @@ template runtimeTest*(nameParam: string, body: untyped) =
   ## Similar to `test`, but always runs at runtime.
   bind collect, shouldRun, checkpoints
 
-  proc runTestAsync(asyncSuiteName, asyncTestName: string): Future[TestRunResult] {.
+  proc runTestAsync(asyncSuiteName, asyncTestName: string): Future[
+      TestRunResult] {.
       async, gcsafe, gensym.} =
     let ctx = AsyncTestContext(
       suiteName: asyncSuiteName,
@@ -1274,15 +1314,16 @@ template runtimeTest*(nameParam: string, body: untyped) =
           block:
             code
         except CatchableError as e: prefix.fail("error", e)
-        except Defect as e:         prefix.fail("defect", e)
-        except Exception as e:      prefix.fail("exception that may cause undefined behavior", e)
+        except Defect as e: prefix.fail("defect", e)
+        except Exception as e: prefix.fail(
+            "exception that may cause undefined behavior", e)
         when NimMajor >= 2: {.pop.}
 
       failAsyncOnExceptions("[setup] "):
         when declared(testSetupIMPLFlag): testSetupIMPL()
         failAsyncOnExceptions(""):
           when not unittest3ListTests:
-            body  # await is valid here; setup-injected vars are in scope
+            body # await is valid here; setup-injected vars are in scope
         failAsyncOnExceptions("[teardown] "):
           when declared(testTeardownIMPLFlag): testTeardownIMPL()
 
@@ -1308,7 +1349,8 @@ template runtimeTest*(nameParam: string, body: untyped) =
           suiteName: localSuiteName,
           asyncImpl: runTestAsync,
           lineInfo: instantiationInfo().line,
-          filename: instantiationInfo().filename
+          filename: instantiationInfo().filename,
+          serial: currentSuiteSerial or currentTestSerial
         )
     when collect:
       tests.mgetOrPut(localSuiteName, default(seq[Test])).add(instance)
@@ -1332,6 +1374,44 @@ template test*(nameParam: string, body: untyped) =
   runtimeTest nameParam:
     when not unittest3ListTests:
       body
+
+template serialTest*(nameParam: string, body: untyped) =
+  ## Define a test case that must not overlap with any other collected test.
+  bind currentTestSerial
+
+  block:
+    let unittest3SavedTestSerial = currentTestSerial
+    currentTestSerial = true
+    test nameParam:
+      body
+    currentTestSerial = unittest3SavedTestSerial
+
+template serialSuite*(nameParam: string, body: untyped) =
+  ## Define a suite whose tests must not overlap with any other collected test.
+  bind currentSuiteSerial
+
+  block:
+    let unittest3SavedSuiteSerial = currentSuiteSerial
+    currentSuiteSerial = true
+    suite nameParam:
+      body
+    currentSuiteSerial = unittest3SavedSuiteSerial
+
+template asyncTest*(nameParam: string, body: untyped) =
+  ## Compatibility alias for async tests. `test` bodies already run in an
+  ## async context, so `await` can be used directly.
+  test nameParam:
+    body
+
+template asyncSetup*(body: untyped) =
+  ## Compatibility alias for async setup blocks.
+  setup:
+    body
+
+template asyncTeardown*(body: untyped) =
+  ## Compatibility alias for async teardown blocks.
+  teardown:
+    body
 
 {.pop.} # raises: []
 
@@ -1359,16 +1439,17 @@ macro check*(conditions: untyped): untyped =
       "AKB48".toLowerAscii() == "akb48"
       'C' notin teams
 
-  {.warning[Deprecated]:off.}
+  {.warning[Deprecated]: off.}
   let checked = callsite()[1]
-  {.warning[Deprecated]:on.}
+  {.warning[Deprecated]: on.}
 
   template print(name: untyped, value: typed) =
     when compiles($value):
       when typeof($value) is string:
         checkpoint(name & " was " & $value)
 
-  proc inspectArgs(exp: NimNode): tuple[frame, inner, check, printOuts: NimNode] =
+  proc inspectArgs(exp: NimNode): tuple[frame, inner, check,
+      printOuts: NimNode] =
     result.check = copyNimTree(exp)
     result.inner = newNimNode(nnkStmtList)
     result.printOuts = newNimNode(nnkStmtList)
@@ -1376,8 +1457,8 @@ macro check*(conditions: untyped): untyped =
     var counter = 0
     let evalOnce = bindSym("unittest3EvalOnce")
     result.frame = result.inner
-    if exp[0].kind in {nnkIdent, nnkOpenSymChoice, nnkClosedSymChoice, nnkSym} and
-        $exp[0] in ["not", "in", "notin", "==", "<=",
+    if exp[0].kind in {nnkIdent, nnkOpenSymChoice, nnkClosedSymChoice,
+        nnkSym} and $exp[0] in ["not", "in", "notin", "==", "<=",
                     ">=", "<", ">", "!=", "is", "isnot"]:
 
       for i in 1 ..< exp.len:
@@ -1426,15 +1507,15 @@ macro check*(conditions: untyped): untyped =
                     ident("&"),
                     lineinfo,
                     newLit(": Check failed: ")
-                  ),
-                  callLit
-                )
-              ),
-              printOuts,
-              nnkCall.newTree(failSym)
-            )
-          )
-        )
+      ),
+      callLit
+    )
+      ),
+      printOuts,
+      nnkCall.newTree(failSym)
+    )
+      )
+    )
       )
     )
 
@@ -1573,18 +1654,18 @@ when unittest3PreviewIsolate:
 
   type
     IsolatedFormatter* = ref object of OutputFormatter
-        ## Formatter suitable for using the process-isolated environment
-        ##
-        ## This is a work in progress with several open issues
-        ## * we could use stderr for "unittest" traffic but it would be
-        ##   compromised by application output (typically ok in nim) and makes
-        ##   reading messy
-        ## * we could print all errors after test providing some sort of
-        ##   separator - has escape issues
-        ## * we could redirect stdout/stderr to a file and use stdout for errors
-        ## * as an addon to the above, we could read back the file then print
-        ##   a structured test format to stdout which the parent process can
-        ##   capture easily
+      ## Formatter suitable for using the process-isolated environment
+      ##
+      ## This is a work in progress with several open issues
+      ## * we could use stderr for "unittest" traffic but it would be
+      ##   compromised by application output (typically ok in nim) and makes
+      ##   reading messy
+      ## * we could print all errors after test providing some sort of
+      ##   separator - has escape issues
+      ## * we could redirect stdout/stderr to a file and use stdout for errors
+      ## * as an addon to the above, we could read back the file then print
+      ##   a structured test format to stdout which the parent process can
+      ##   capture easily
 
   if isolated:
     formatters.add(IsolatedFormatter())
@@ -1613,7 +1694,8 @@ when collect:
         else:
           let testTimeout = unittest3TestTimeoutSeconds.seconds
           let timeoutFuture = chronos.sleepAsync(testTimeout)
-          discard await chronos.race(@[FutureBase(testFuture), FutureBase(timeoutFuture)])
+          discard await chronos.race(@[FutureBase(testFuture), FutureBase(
+              timeoutFuture)])
 
           if timeoutFuture.finished() and not testFuture.finished():
             testFuture.cancelSoon()
@@ -1621,8 +1703,8 @@ when collect:
             testRunResult = TestRunResult(
               status: TestStatus.FAILED,
               output:
-                "[TIMEOUT] Test exceeded timeout of " &
-                $unittest3TestTimeoutSeconds & " seconds.\n"
+              "[TIMEOUT] Test exceeded timeout of " &
+              $unittest3TestTimeoutSeconds & " seconds.\n"
             )
           else:
             if not timeoutFuture.finished():
@@ -1635,8 +1717,8 @@ when collect:
                 output: "Test future was cancelled.\n"
               )
     except Exception as e:
-      discard e  # asyncImpl catches all exceptions internally; status already set
-    
+      discard e # asyncImpl catches all exceptions internally; status already set
+
     testEnded(TestResult(
       suiteName: test.suiteName,
       testName: test.testName,
@@ -1648,7 +1730,7 @@ when collect:
   proc runScheduledTestsAsync(
       tmp: OrderedTable[string, seq[Test]]
   ) {.async.} =
-    type InflightEntry = tuple[fut: FutureBase, suiteName: string]
+    type InflightEntry = tuple[fut: FutureBase, suiteName: string, serial: bool]
     var
       allTests: seq[tuple[suiteName: string, test: Test]]
       suiteTotals: Table[string, int]
@@ -1663,8 +1745,7 @@ when collect:
       for t in suite:
         allTests.add((sn, t))
 
-    const LOW = unittest3LowWatermark
-    const HIGH = unittest3HighWatermark
+    let jobLimit = getRuntimeJobs()
 
     while idx < allTests.len or inflight.len > 0:
       # Reap completed futures; signal suiteEnded when last test of suite finishes
@@ -1679,33 +1760,37 @@ when collect:
           nextInflight.add(entry)
       inflight = nextInflight
 
-      # Launch new tests up to HIGH watermark
-      while idx < allTests.len and inflight.len < HIGH:
+      # Launch new tests up to the configured job limit.
+      var blockedBySerial = false
+      while idx < allTests.len and inflight.len < jobLimit:
+        if inflight.anyIt(it.serial):
+          blockedBySerial = true
+          break
+
         let (sn, t) = allTests[idx]
+        if t.serial and inflight.len > 0:
+          blockedBySerial = true
+          break
+
         if sn notin suiteBegun:
           suiteStarted(sn)
           suiteBegun.incl(sn)
-        inflight.add((FutureBase(runAsync(t)), sn))
+        inflight.add((FutureBase(runAsync(t)), sn, t.serial))
         inc idx
+        if t.serial:
+          break
 
       if inflight.len == 0:
         break
 
-      if inflight.len >= HIGH or idx >= allTests.len:
+      if blockedBySerial or inflight.len >= jobLimit or idx >= allTests.len:
         # At capacity or all tests launched: wait for one to finish
         try:
           discard await chronos.race(inflight.mapIt(it.fut))
         except ValueError:
-          discard  # inflight is non-empty so this should not fire
+          discard # inflight is non-empty so this should not fire
         except CancelledError:
           break
-      elif inflight.len >= LOW:
-        # Enough tests running: yield briefly to let blocked tests progress
-        try:
-          await chronos.sleepAsync(chronos.ZeroDuration)
-        except CancelledError:
-          break
-      # else: inflight < LOW — keep filling without yielding
 
   proc runScheduledTests() {.noconv.} =
     # Tests can be added inside tests - this is weird and only partially
