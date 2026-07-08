@@ -1,113 +1,14 @@
 # unittest3
 #
+#        (c) Copyright 2026 @vladopajic
+#
+# and authors of unittest2
 #        (c) Copyright 2015 Nim Contributors
 #        (c) Copyright 2019-2021 Ștefan Talpalaru
 #        (c) Copyright 2021-Onwards Status Research and Development
 #
 
 {.push raises: [].}
-
-## :Authors: Zahary Karadjov, Ștefan Talpalaru, Status Research and Development
-##
-## This module makes unit testing easy.
-##
-## .. code::
-##   nim c -r testfile.nim
-##
-## exits with 0 or 1.
-##
-## Running individual tests
-## ========================
-##
-## Specify the test names as command line arguments.
-##
-## .. code::
-##
-##   nim c -r test "my test name" "another test"
-##
-## Multiple arguments can be used.
-##
-## Running a single test suite
-## ===========================
-##
-## Specify the suite name delimited by ``"::"``.
-##
-## .. code::
-##
-##   nim c -r test "my suite name::"
-##
-## Selecting tests by pattern
-## ==========================
-##
-## A single ``"*"`` can be used for globbing.
-##
-## Delimit the end of a suite name with ``"::"``.
-##
-## Tests matching **any** of the arguments are executed.
-##
-## .. code::
-##
-##   nim c -r test fast_suite::mytest1 fast_suite::mytest2
-##   nim c -r test "fast_suite::mytest*"
-##   nim c -r test "auth*::" "crypto::hashing*"
-##   # Run suites starting with 'bug #' and standalone tests starting with '#'
-##   nim c -r test 'bug #*::' '::#*'
-##
-## Command line arguments
-## ======================
-##
-## The unit test runner recognises serveral parameters that can be specified
-## either via environment or command line, the latter taking precedence.
-##
-## Several options also have defaults that can be controlled at compile-time.
-##
-## --help             Print short help and quit
-## --xml:file         Write JUnit-compatible XML report to `file`
-## --console          Write report to the console (default, when no other output
-##                    is selected)
-## --output-lvl:level Verbosity of output [COMPACT, VERBOSE, FAILURES, NONE] (env: unittest3_OUTPUT_LVL)
-## --verbose, -v      Shorthand for --output-lvl:VERBOSE
-##
-## Command line parsing can be disabled with `-d:unittest3DisableParamFiltering`.
-##
-## Running tests in parallel
-## =========================
-##
-## Early versions of this library had rudimentary support for running tests in
-## parallel - this has since been removed due to safety issues in the
-## implementation and may be reintroduced at a future date.
-##
-## Example
-## -------
-##
-## .. code:: nim
-##
-##   suite "description for this stuff":
-##     echo "suite setup: run once before the tests"
-##
-##     setup:
-##       echo "run before each test"
-##
-##     teardown:
-##       echo "run after each test"
-##
-##     test "essential truths":
-##       # give up and stop if this fails
-##       require(true)
-##
-##     test "slightly less obvious stuff":
-##       # print a nasty message and move on, skipping
-##       # the remainder of this block
-##       check(1 != 1)
-##       check("asd"[2] == 'd')
-##
-##     test "out of bounds error is thrown on bad access":
-##       let v = @[1, 2, 3]  # you can do initialization here
-##       expect(IndexError):
-##         discard v[4]
-##
-##     suiteTeardown:
-##       echo "suite teardown: run once after the tests"
 
 import std/[macros, sequtils, sets, strutils, streams, tables]
 import chronos except await
