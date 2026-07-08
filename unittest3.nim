@@ -1,5 +1,8 @@
-# unittest2
+# unittest3
 #
+#        (c) Copyright 2026 @vladopajic
+#
+# and authors of unittest2
 #        (c) Copyright 2015 Nim Contributors
 #        (c) Copyright 2019-2021 Ștefan Talpalaru
 #        (c) Copyright 2021-Onwards Status Research and Development
@@ -7,110 +10,11 @@
 
 {.push raises: [].}
 
-## :Authors: Zahary Karadjov, Ștefan Talpalaru, Status Research and Development
-##
-## This module makes unit testing easy.
-##
-## .. code::
-##   nim c -r testfile.nim
-##
-## exits with 0 or 1.
-##
-## Running individual tests
-## ========================
-##
-## Specify the test names as command line arguments.
-##
-## .. code::
-##
-##   nim c -r test "my test name" "another test"
-##
-## Multiple arguments can be used.
-##
-## Running a single test suite
-## ===========================
-##
-## Specify the suite name delimited by ``"::"``.
-##
-## .. code::
-##
-##   nim c -r test "my suite name::"
-##
-## Selecting tests by pattern
-## ==========================
-##
-## A single ``"*"`` can be used for globbing.
-##
-## Delimit the end of a suite name with ``"::"``.
-##
-## Tests matching **any** of the arguments are executed.
-##
-## .. code::
-##
-##   nim c -r test fast_suite::mytest1 fast_suite::mytest2
-##   nim c -r test "fast_suite::mytest*"
-##   nim c -r test "auth*::" "crypto::hashing*"
-##   # Run suites starting with 'bug #' and standalone tests starting with '#'
-##   nim c -r test 'bug #*::' '::#*'
-##
-## Command line arguments
-## ======================
-##
-## The unit test runner recognises serveral parameters that can be specified
-## either via environment or command line, the latter taking precedence.
-##
-## Several options also have defaults that can be controlled at compile-time.
-##
-## --help             Print short help and quit
-## --xml:file         Write JUnit-compatible XML report to `file`
-## --console          Write report to the console (default, when no other output
-##                    is selected)
-## --output-lvl:level Verbosity of output [COMPACT, VERBOSE, FAILURES, NONE] (env: UNITTEST2_OUTPUT_LVL)
-## --verbose, -v      Shorthand for --output-lvl:VERBOSE
-##
-## Command line parsing can be disabled with `-d:unittest2DisableParamFiltering`.
-##
-## Running tests in parallel
-## =========================
-##
-## Early versions of this library had rudimentary support for running tests in
-## parallel - this has since been removed due to safety issues in the
-## implementation and may be reintroduced at a future date.
-##
-## Example
-## -------
-##
-## .. code:: nim
-##
-##   suite "description for this stuff":
-##     echo "suite setup: run once before the tests"
-##
-##     setup:
-##       echo "run before each test"
-##
-##     teardown:
-##       echo "run after each test"
-##
-##     test "essential truths":
-##       # give up and stop if this fails
-##       require(true)
-##
-##     test "slightly less obvious stuff":
-##       # print a nasty message and move on, skipping
-##       # the remainder of this block
-##       check(1 != 1)
-##       check("asd"[2] == 'd')
-##
-##     test "out of bounds error is thrown on bad access":
-##       let v = @[1, 2, 3]  # you can do initialization here
-##       expect(IndexError):
-##         discard v[4]
-##
-##     suiteTeardown:
-##       echo "suite teardown: run once after the tests"
-
-import std/[
-  macros, sequtils, sets, strutils, streams, tables, times, monotimes]
+import std/[macros, sequtils, sets, strutils, streams, tables]
+import chronos except await
+export chronos except await
+import chronicles
+export chronicles
 
 when defined(nimHasWarnBareExcept):
   # In unit tests, we want to at least attempt to catch Exception no matter its
@@ -121,6 +25,9 @@ when defined(nimHasWarnBareExcept):
 
 when declared(stdout):
   import std/os
+
+when declared(stdout) and defined(posix):
+  import std/posix
 
 const useTerminal = declared(stdout) and not defined(js)
 
@@ -133,47 +40,54 @@ type
 
 const
   outputLevelDefault = COMPACT
-  slowThreshold = initDuration(seconds = 5)
+  slowThreshold = 5.seconds
 
   # `unittest` compatibility
   nimUnittestOutputLevel {.strdefine.} = $outputLevelDefault
   nimUnittestColor {.strdefine.} = "auto" ## auto|on|off
   nimUnittestAbortOnError {.booldefine.} = false
 
-  # `unittest2` compile-time configuration options
-  unittest2DisableParamFiltering {.booldefine.} = false
+  # `unittest3` compile-time configuration options
+  unittest3DisableParamFiltering {.booldefine.} = false
     ## Disables automatic command line argument parsing - parsing is available
     ## via the `parseParameters` function instead
-  unittest2Compat {.booldefine.} = true # This will be disabled in the future
+  unittest3Compat {.booldefine.} = false
     ## Compatibility mode for `unittest` for easier porting and improved
     ## backwards compatibility - no stability guarantees
-  unittest2NoCollect {.booldefine.} = false
+  unittest3NoCollect {.booldefine.} = false
     ## Disable test collection mode where tests are enumerated before they are
     ## run - in particular, this affects the order in which tests and suites
     ## have their bodies evaluated and disables several features that require
     ## knowing how many tests will be executed - experimental feature
-  unittest2PreviewIsolate {.booldefine.} = false
+  unittest3PreviewIsolate {.booldefine.} = false
     ## Preview isolation mode where each test is run in a separate process - may
     ## be removed in the future
-  unittest2Static* {.booldefine.} = false
-    ## Run tests at compile time as well - only a subset of functionality is
-    ## enabled at compile-time meaning that tests must be written
-    ## conservatively. `suite` features (`setup` etc) in particular are not
-    ## supported.
-  unittest2ListTests* {.booldefine.} = false
+  unittest3ListTests* {.booldefine.} = false
     ## List tests at runtime without actually running them (useful for test runners)
+
+  unittest3LowWatermark* {.intdefine.} = 4
+    ## Minimum number of concurrent tests to keep in flight.
+    ## When in-flight count drops below this, new tests are started immediately.
+  unittest3HighWatermark* {.intdefine.} = 8
+    ## Maximum number of concurrent tests in flight.
+    ## New tests are not started until a running test completes.
+
+static:
+  doAssert unittest3LowWatermark <= unittest3HighWatermark,
+    "unittest3LowWatermark must be <= unittest3HighWatermark"
 
 when useTerminal:
   import std/terminal
 
+
 const
-  collect = (not unittest2NoCollect and not unittest2Compat) or unittest2PreviewIsolate or unittest2ListTests
-  autoParseArgs = not unittest2DisableParamFiltering
-  isolate = unittest2PreviewIsolate
+  collect = (not unittest3NoCollect and not unittest3Compat) or unittest3PreviewIsolate or unittest3ListTests
+  autoParseArgs = not unittest3DisableParamFiltering
+  isolate = unittest3PreviewIsolate
 
 when isolate:
   let
-    isolated = getEnv("UNITTEST2_ISOLATED") == "1"
+    isolated = getEnv("unittest3_ISOLATED") == "1"
       ## Test is running in the isolated environment
 
 from std/exitprocs import nil
@@ -188,7 +102,7 @@ type
   Test = object
     suiteName: string
     testName: string
-    impl: proc(suite, name: string): TestStatus
+    asyncImpl: proc(suite, name: string): Future[TestRunResult]
     lineInfo: int
     filename: string
 
@@ -196,6 +110,10 @@ type
     OK,
     FAILED,
     SKIPPED
+
+  TestRunResult = object
+    status: TestStatus
+    output: string
 
   TestResult* = object
     suiteName*: string
@@ -233,6 +151,7 @@ type
     curSuite: int
     curTestName: string
     curTest: int
+    compactLineOpen: bool
 
     statuses: array[TestStatus, int]
 
@@ -260,6 +179,17 @@ type
     suites: seq[JUnitSuite]
     currentSuite: int
 
+  AsyncTestContext = ref object
+    ## Per-test state for async execution. Avoids shared global `testStatus` /
+    ## `checkpoints` being corrupted when tests interleave at `await` points.
+    suiteName: string
+    testName: string
+    status: TestStatus
+    checkpoints: seq[string]
+    outputPath: string
+    outputFile: File
+    outputCaptureEnabled: bool
+
 # TODO these globals are threadvar so as to avoid gc-safety-issues - this should
 #      probably be resolved in a better way down the line specially since we
 #      don't support threads _really_
@@ -270,13 +200,189 @@ var
     ## immediately on fail. Default is false,
     ## or override with `-d:nimUnittestAbortOnError:on|off`.
 
-  checkpointsVm {.compileTime.}: seq[string]
   checkpoints {.threadvar.}: seq[string]
   formatters {.threadvar.}: seq[OutputFormatter]
   testsFilters {.threadvar.}: HashSet[string]
 
   currentSuite {.threadvar.}: string
   testStatus {.threadvar.}: TestStatus
+  currentAsyncCtx {.threadvar.}: AsyncTestContext
+    ## Points to the currently-executing async test's context. Nil outside async tests.
+    ## Because chronos is single-threaded cooperative, only one test runs between
+    ## await points, so this pointer is always valid for the active test.
+  stdoutCaptureCounter {.threadvar.}: int
+  lastExecutedSuite {.threadvar.}: string
+  lastExecutedTest {.threadvar.}: string
+
+when declared(stdout) and defined(posix):
+  var
+    savedStdoutFd {.threadvar.}: cint
+    savedStderrFd {.threadvar.}: cint
+
+  proc ensureSavedOutputFds() =
+    if savedStdoutFd <= 0:
+      try:
+        savedStdoutFd = dup(cint(stdout.getFileHandle()))
+      except CatchableError:
+        savedStdoutFd = 0
+    if savedStderrFd <= 0:
+      try:
+        savedStderrFd = dup(cint(stderr.getFileHandle()))
+      except CatchableError:
+        savedStderrFd = 0
+
+  proc redirectFileTo(f: File, fd: cint) =
+    try:
+      f.flushFile()
+    except CatchableError:
+      discard
+    if fd >= 0:
+      discard dup2(fd, cint(f.getFileHandle()))
+
+  proc restoreStdoutCapture() =
+    ensureSavedOutputFds()
+    redirectFileTo(stdout, savedStdoutFd)
+    redirectFileTo(stderr, savedStderrFd)
+
+  proc activateStdoutCapture(ctx: AsyncTestContext) =
+    if ctx != nil and ctx.outputCaptureEnabled:
+      let fd = cint(ctx.outputFile.getFileHandle())
+      redirectFileTo(stdout, fd)
+      redirectFileTo(stderr, fd)
+
+  proc appendTestOutput(ctx: AsyncTestContext, output: string) =
+    if ctx != nil and ctx.outputCaptureEnabled:
+      try:
+        ctx.outputFile.write(output)
+        if output.len == 0 or output[^1] != '\n':
+          ctx.outputFile.write("\n")
+        ctx.outputFile.flushFile()
+      except CatchableError:
+        discard
+    else:
+      try:
+        stdout.write(output)
+        if output.len == 0 or output[^1] != '\n':
+          stdout.write("\n")
+        stdout.flushFile()
+      except CatchableError:
+        discard
+
+  proc suspendTestOutputCapture() =
+    restoreStdoutCapture()
+
+  proc resumeTestOutputCapture() =
+    activateStdoutCapture(currentAsyncCtx)
+
+  proc startTestOutputCapture(ctx: AsyncTestContext) =
+    ensureSavedOutputFds()
+    if savedStdoutFd <= 0 or savedStderrFd <= 0:
+      return
+
+    try:
+      inc stdoutCaptureCounter
+      ctx.outputPath = getTempDir() / (
+        "unittest3-stdout-" & $getCurrentProcessId() & "-" &
+        $stdoutCaptureCounter & ".out")
+      if open(ctx.outputFile, ctx.outputPath, fmWrite):
+        ctx.outputCaptureEnabled = true
+        activateStdoutCapture(ctx)
+    except CatchableError:
+      ctx.outputCaptureEnabled = false
+
+  proc finishTestOutputCapture(ctx: AsyncTestContext): string =
+    if ctx == nil or not ctx.outputCaptureEnabled:
+      return ""
+
+    try:
+      ctx.outputFile.flushFile()
+    except CatchableError:
+      discard
+
+    restoreStdoutCapture()
+
+    try:
+      ctx.outputFile.close()
+    except CatchableError:
+      discard
+
+    try:
+      result = readFile(ctx.outputPath)
+    except CatchableError:
+      result = ""
+
+    try:
+      removeFile(ctx.outputPath)
+    except CatchableError:
+      discard
+
+    ctx.outputCaptureEnabled = false
+else:
+  proc appendTestOutput(ctx: AsyncTestContext, output: string) =
+    discard
+  proc suspendTestOutputCapture() = discard
+  proc resumeTestOutputCapture() = discard
+  proc startTestOutputCapture(ctx: AsyncTestContext) = discard
+  proc finishTestOutputCapture(ctx: AsyncTestContext): string = ""
+
+proc chroniclesTestOutputWriter(logLevel: LogLevel, logRecord: LogOutputStr) {.
+    gcsafe, used.} =
+  discard logLevel
+  {.cast(gcsafe).}:
+    appendTestOutput(currentAsyncCtx, string(logRecord))
+
+template installChroniclesTestOutput() {.dirty.} =
+  bind chroniclesTestOutputWriter
+  mixin defaultChroniclesStream
+  when declared(defaultChroniclesStream):
+    when compiles(defaultChroniclesStream.outputs[0].writer = chroniclesTestOutputWriter):
+      defaultChroniclesStream.outputs[0].writer = chroniclesTestOutputWriter
+    when compiles(defaultChroniclesStream.outputs[1].writer = chroniclesTestOutputWriter):
+      defaultChroniclesStream.outputs[1].writer = chroniclesTestOutputWriter
+    when compiles(defaultChroniclesStream.outputs[2].writer = chroniclesTestOutputWriter):
+      defaultChroniclesStream.outputs[2].writer = chroniclesTestOutputWriter
+    when compiles(defaultChroniclesStream.outputs[3].writer = chroniclesTestOutputWriter):
+      defaultChroniclesStream.outputs[3].writer = chroniclesTestOutputWriter
+
+proc noteTestExecution(suiteName, testName: string) {.gcsafe.}
+
+template await*[T](f: Future[T]): T =
+  let unittest3AwaitCtx = currentAsyncCtx
+  suspendTestOutputCapture()
+  when T is void:
+    chronos.await(f)
+    {.cast(gcsafe).}:
+      currentAsyncCtx = unittest3AwaitCtx
+    if unittest3AwaitCtx != nil:
+      noteTestExecution(unittest3AwaitCtx.suiteName, unittest3AwaitCtx.testName)
+    resumeTestOutputCapture()
+  else:
+    let unittest3AwaitResult = chronos.await(f)
+    {.cast(gcsafe).}:
+      currentAsyncCtx = unittest3AwaitCtx
+    if unittest3AwaitCtx != nil:
+      noteTestExecution(unittest3AwaitCtx.suiteName, unittest3AwaitCtx.testName)
+    resumeTestOutputCapture()
+    unittest3AwaitResult
+
+template await*[T, E](f: InternalRaisesFuture[T, E]): T =
+  let unittest3AwaitCtx = currentAsyncCtx
+  suspendTestOutputCapture()
+  when T is void:
+    chronos.await(f)
+    {.cast(gcsafe).}:
+      currentAsyncCtx = unittest3AwaitCtx
+    if unittest3AwaitCtx != nil:
+      noteTestExecution(unittest3AwaitCtx.suiteName, unittest3AwaitCtx.testName)
+    resumeTestOutputCapture()
+  else:
+    let unittest3AwaitResult = chronos.await(f)
+    {.cast(gcsafe).}:
+      currentAsyncCtx = unittest3AwaitCtx
+    if unittest3AwaitCtx != nil:
+      noteTestExecution(unittest3AwaitCtx.suiteName, unittest3AwaitCtx.testName)
+    resumeTestOutputCapture()
+    unittest3AwaitResult
 
 when collect:
   var
@@ -285,7 +391,7 @@ when collect:
 abortOnError = nimUnittestAbortOnError
 
 when declared(stdout):
-  if existsEnv("UNITTEST2_ABORT_ON_ERROR") or existsEnv("NIMTEST_ABORT_ON_ERROR"):
+  if existsEnv("unittest3_ABORT_ON_ERROR") or existsEnv("NIMTEST_ABORT_ON_ERROR"):
     abortOnError = true
 
 when collect:
@@ -297,6 +403,9 @@ when collect:
 method suiteStarted*(formatter: OutputFormatter, suiteName: string) {.base, gcsafe.} =
   discard
 method testStarted*(formatter: OutputFormatter, testName: string) {.base, gcsafe.} =
+  discard
+method testExecutionSwitched*(
+    formatter: OutputFormatter, suiteName, testName: string) {.base, gcsafe.} =
   discard
 method failureOccurred*(formatter: OutputFormatter, checkpoints: seq[string],
     stackTrace: string) {.base, gcsafe.} =
@@ -329,6 +438,18 @@ proc suiteStarted(name: string) =
 proc testStarted(name: string) =
   for formatter in formatters:
     formatter.testStarted(name)
+
+proc testExecutionSwitched(suiteName, testName: string) {.gcsafe.} =
+  for formatter in formatters:
+    formatter.testExecutionSwitched(suiteName, testName)
+
+proc noteTestExecution(suiteName, testName: string) {.gcsafe.} =
+  if lastExecutedSuite.len > 0 and
+      (lastExecutedSuite != suiteName or lastExecutedTest != testName):
+    testExecutionSwitched(suiteName, testName)
+
+  lastExecutedSuite = suiteName
+  lastExecutedTest = testName
 
 proc testEnded(testResult: TestResult) =
   for formatter in formatters:
@@ -376,7 +497,7 @@ proc defaultColorOutput(): bool =
   else: raiseAssert "Unrecognised nimUnittestColor setting: " & color
 
   when declared(stdout):
-    # TODO unittest2-equivalent color parsing
+    # TODO unittest3-equivalent color parsing
     if existsEnv("NIMTEST_COLOR"):
       let colorEnv = getEnv("NIMTEST_COLOR")
       if colorEnv == "never":
@@ -388,13 +509,13 @@ proc defaultColorOutput(): bool =
 
 proc defaultOutputLevel(): OutputLevel =
   when declared(stdout):
-    const levelEnv = "UNITTEST2_OUTPUT_LVL"
+    const levelEnv = "unittest3_OUTPUT_LVL"
     const nimtestEnv = "NIMTEST_OUTPUT_LVL"
     if existsEnv(levelEnv):
       try:
         parseEnum[OutputLevel](getEnv(levelEnv))
       except ValueError:
-        echo "Cannot parse UNITTEST2_OUTPUT_LVL: ", getEnv(levelEnv)
+        echo "Cannot parse unittest3_OUTPUT_LVL: ", getEnv(levelEnv)
         quit 1
     elif existsEnv(nimtestEnv):
       # std-compatible parsing and translation
@@ -424,7 +545,7 @@ func formatStatus(status: TestStatus): string =
 
 proc formatDuration(dur: Duration, aligned = true): string =
   let
-    seconds = dur.inMilliseconds.float / 1000.0
+    seconds = dur.nanoseconds.float / 1_000_000_000.0
     precision = max(3 - ($seconds.int).len, 1)
     str = formatFloat(seconds, ffDecimal, precision)
 
@@ -478,11 +599,17 @@ method suiteStarted*(formatter: ConsoleOutputFormatter, suiteName: string) =
         if formatter.outputLevel == VERBOSE: formatStatus("Suite") & " " else: ""
     maxNameLen = when collect: max(toSeq(formatter.tests.keys()).mapIt(it.len)) else: 0
     eol = if formatter.outputLevel == VERBOSE: "\n" else: " "
+  if formatter.outputLevel == COMPACT and formatter.compactLineOpen:
+    echo ""
+    formatter.compactLineOpen = false
+
   formatter.write do:
     stdout.styledWrite(styleBright, fgBlue, counter, alignLeft(suiteName, maxNameLen), eol)
   do:
     stdout.write(counter, alignLeft(suiteName, maxNameLen), eol)
   stdout.flushFile()
+  if formatter.outputLevel == COMPACT:
+    formatter.compactLineOpen = true
 
 proc writeTestName(formatter: ConsoleOutputFormatter, testName: string) =
   formatter.write do:
@@ -515,6 +642,21 @@ method testStarted*(formatter: ConsoleOutputFormatter, testName: string) =
 
   writeTestName(formatter, testName)
   echo ""
+
+method testExecutionSwitched*(
+    formatter: ConsoleOutputFormatter, suiteName, testName: string) =
+  discard suiteName
+  discard testName
+
+  if formatter.outputLevel != COMPACT:
+    return
+
+  formatter.write do:
+    stdout.styledWrite styleBright, fgGreen, "."
+  do:
+    stdout.write "."
+  stdout.flushFile()
+  formatter.compactLineOpen = true
 
 method failureOccurred*(formatter: ConsoleOutputFormatter,
                         checkpoints: seq[string], stackTrace: string) =
@@ -556,6 +698,22 @@ proc printFailureInfo(formatter: ConsoleOutputFormatter, testResult: TestResult)
   if testResult.errors.len > 0:
     echo testResult.errors
 
+proc printCapturedOutput(formatter: ConsoleOutputFormatter, output: string) =
+  if output.len == 0:
+    return
+
+  if formatter.outputLevel == COMPACT:
+    echo ""
+    formatter.compactLineOpen = false
+
+  try:
+    stdout.write(output)
+    if output[^1] != '\n':
+      echo ""
+    formatter.compactLineOpen = false
+  except CatchableError:
+    discard
+
 proc printTestResultStatus(formatter: ConsoleOutputFormatter, testResult: TestResult) =
   let
     status = formatStatus(testResult.status)
@@ -583,6 +741,10 @@ method testEnded*(formatter: ConsoleOutputFormatter, testResult: TestResult) =
   var testResult = testResult
   testResult.errors = move(formatter.errors)
 
+  if formatter.outputLevel == COMPACT and testResult.output.len > 0:
+    formatter.printCapturedOutput(testResult.output)
+    testResult.output.reset()
+
   formatter.results.add(testResult)
 
   if formatter.outputLevel == VERBOSE and testResult.status == TestStatus.FAILED:
@@ -592,6 +754,8 @@ method testEnded*(formatter: ConsoleOutputFormatter, testResult: TestResult) =
   if formatter.outputLevel in {VERBOSE, FAILURES}:
     if testResult.status == TestStatus.FAILED:
       printFailureInfo(formatter, testResult)
+    elif formatter.outputLevel == VERBOSE:
+      formatter.printCapturedOutput(testResult.output)
     if formatter.outputLevel == VERBOSE or testResult.status == TestStatus.FAILED:
       printTestResultStatus(formatter, testResult)
   else:
@@ -610,13 +774,14 @@ method testEnded*(formatter: ConsoleOutputFormatter, testResult: TestResult) =
     do:
       stdout.write marker
     stdout.flushFile()
+    formatter.compactLineOpen = true
 
 method suiteEnded*(formatter: ConsoleOutputFormatter) =
   if formatter.outputLevel == OutputLevel.NONE:
     return
 
   let
-    totalDur = formatter.results.foldl(a + b.duration, DurationZero)
+    totalDur = formatter.results.foldl(a + b.duration, 0.seconds)
     totalDurStr = formatDuration(totalDur, false)
 
   if formatter.outputLevel == OutputLevel.COMPACT:
@@ -630,12 +795,14 @@ method suiteEnded*(formatter: ConsoleOutputFormatter) =
         echo ""
       do:
         echo(" ", totalDurStr)
+      formatter.compactLineOpen = false
     else:
       formatter.write do:
         # If no tests were run, remove the suite name
         stdout.eraseLine()
       do:
         stdout.writeLine("")
+      formatter.compactLineOpen = false
 
   var failed = false
   if formatter.outputLevel notin {VERBOSE, FAILURES}:
@@ -751,8 +918,8 @@ method testEnded*(formatter: JUnitOutputFormatter, testResult: TestResult) =
 method suiteEnded*(formatter: JUnitOutputFormatter) =
   formatter.currentSuite = -1
 
-func toFloatSeconds(duration: Duration): float64 =
-  duration.inNanoseconds().float64 / 1_000_000_000.0
+func toFloatSeconds(d: Duration): float64 =
+  d.nanoseconds.float / 1_000_000_000.0
 
 proc writeTest(s: Stream, test: JUnitTest) {.raises: [CatchableError].} =
   let
@@ -870,17 +1037,14 @@ when defined(testing): export matchFilter
 proc shouldRun(currentSuiteName, testName: string): bool =
   ## Check if a test should be run by matching suiteName and testName against
   ## test filters.
-  when nimvm:
-    true
-  else:
-    if testsFilters.len == 0:
+  if testsFilters.len == 0:
+    return true
+
+  for f in testsFilters:
+    if matchFilter(currentSuiteName, testName, f):
       return true
 
-    for f in testsFilters:
-      if matchFilter(currentSuiteName, testName, f):
-        return true
-
-    return false
+  return false
 
 proc parseParameters*(args: openArray[string]) =
   var
@@ -973,18 +1137,15 @@ template suite*(nameParam: string, body: untyped) {.dirty.} =
       var testSuiteTeardownIMPLFlag {.used.} = true
       template testSuiteTeardownIMPL: untyped {.dirty.} = suiteTeardownBody
 
-    when nimvm:
-      discard
-    else:
-      let suiteName {.inject.} = nameParam
-      when not collect:
-        # TODO deal with suite nesting
-        if currentSuite.len > 0:
-          suiteEnded()
-          currentSuite.reset()
-        currentSuite = suiteName
+    let suiteName {.inject.} = nameParam
+    when not collect:
+      # TODO deal with suite nesting
+      if currentSuite.len > 0:
+        suiteEnded()
+        currentSuite.reset()
+      currentSuite = suiteName
 
-        suiteStarted(suiteName)
+      suiteStarted(suiteName)
 
     # TODO what about exceptions in the suite itself?
     body
@@ -992,12 +1153,9 @@ template suite*(nameParam: string, body: untyped) {.dirty.} =
     when declared(testSuiteTeardownIMPLFlag):
       testSuiteTeardownIMPL()
 
-    when nimvm:
-      discard
-    else:
-      when not collect:
-        suiteEnded()
-        currentSuite.reset()
+    when not collect:
+      suiteEnded()
+      currentSuite.reset()
 
 template checkpoint*(msg: string) =
   ## Set a checkpoint identified by `msg`. Upon test failure all
@@ -1010,14 +1168,13 @@ template checkpoint*(msg: string) =
   ##  checkpoint("Checkpoint B")
   ##
   ## outputs "Checkpoint A" once it fails.
-  when nimvm:
-    {.cast(gcsafe).}:
-      checkpointsVm.add msg
-  else:
-    bind checkpoints
+  bind checkpoints
 
+  if currentAsyncCtx != nil:
+    currentAsyncCtx.checkpoints.add(msg)
+  else:
     checkpoints.add(msg)
-    # TODO: add support for something like SCOPED_TRACE from Google Test
+  # TODO: add support for something like SCOPED_TRACE from Google Test
 
 template fail* =
   ## Print out the checkpoints encountered so far and quit if ``abortOnError``
@@ -1032,31 +1189,30 @@ template fail* =
   ##  fail()
   ##
   ## outputs "Checkpoint A" before quitting.
-  when nimvm:
-    echo "Tests failed"
-    {.cast(gcsafe).}:
-      for msg in items(checkpointsVm):
-        echo("    ")
-        echo(msg)
-        echo("\n")
-    quit 1
+  if currentAsyncCtx != nil:
+    currentAsyncCtx.status = TestStatus.FAILED
   else:
     testStatus = TestStatus.FAILED
 
-    exitProcs.setProgramResult(1)
+  exitProcs.setProgramResult(1)
 
-    for formatter in formatters:
-      let formatter = formatter # avoid lent iterator
-      when declared(stackTrace):
-        when stackTrace is string:
-          formatter.failureOccurred(checkpoints, stackTrace)
-        else:
-          formatter.failureOccurred(checkpoints, "")
+  for formatter in formatters:
+    let formatter = formatter # avoid lent iterator
+    let cp = if currentAsyncCtx != nil: currentAsyncCtx.checkpoints
+             else: checkpoints
+    when declared(stackTrace):
+      when stackTrace is string:
+        formatter.failureOccurred(cp, stackTrace)
       else:
-        formatter.failureOccurred(checkpoints, "")
+        formatter.failureOccurred(cp, "")
+    else:
+      formatter.failureOccurred(cp, "")
 
-    if abortOnError: quit(1)
+  if abortOnError: quit(1)
 
+  if currentAsyncCtx != nil:
+    currentAsyncCtx.checkpoints.reset()
+  else:
     checkpoints.reset()
 
 template skip* =
@@ -1070,88 +1226,64 @@ template skip* =
   ##
   ##  if not isGLContextCreated():
   ##    skip()
-  when nimvm:
-    {.cast(gcsafe).}:
-      reset checkpointsVm
-  else:
-    bind checkpoints
+  bind checkpoints
 
+  if currentAsyncCtx != nil:
+    currentAsyncCtx.status = TestStatus.SKIPPED
+    currentAsyncCtx.checkpoints = @[]
+  else:
     testStatus = TestStatus.SKIPPED
     checkpoints = @[]
 
-proc runDirect(test: Test) =
-  when not collect:
-    # In collection mode, we implicitly create a suite based on the module name
-    # and start it based on the test list but in non-collect mode, we have to
-    # emulate this with this hack
-    if currentSuite != test.suiteName:
-      if currentSuite.len > 0:
-        suiteEnded()
-      suiteStarted(test.suiteName)
-      currentSuite = test.suiteName
-
-  let startTime = getMonoTime()
-  testStarted(test.testName)
-
-  # TODO this annotation works around a limitation where we know that we only
-  #      call the callback from the main thread but the compiler doesn't -
-  #      when / if testing becomes multithreaded, this will need a proper
-  #      solution
-  {.gcsafe.}:
-    let
-      status = test.impl(test.suiteName, test.testName)
-      duration = getMonoTime() - startTime
-
-  testEnded(TestResult(
-    suiteName: test.suiteName,
-    testName: test.testName,
-    status: status,
-    duration: duration
-  ))
-
 template runtimeTest*(nameParam: string, body: untyped) =
-  ## Similar to `test` but runs only at run time, no matter the `unittest2Static`
-  ## setting
-  bind collect, runDirect, shouldRun, checkpoints
+  ## Similar to `test`, but always runs at runtime.
+  bind collect, shouldRun, checkpoints
 
-  proc runTest(suiteName, testName: string): TestStatus {.raises: [], gensym.} =
-    testStatus = TestStatus.OK
-    template testStatusIMPL: var TestStatus {.inject, used.} = testStatus
-    let suiteName {.inject, used.} = suiteName
-    let testName {.inject, used.} = testName
+  proc runTestAsync(asyncSuiteName, asyncTestName: string): Future[TestRunResult] {.
+      async, gcsafe, gensym.} =
+    let ctx = AsyncTestContext(
+      suiteName: asyncSuiteName,
+      testName: asyncTestName,
+      status: TestStatus.OK,
+      checkpoints: @[])
+    {.cast(gcsafe).}:
+      currentAsyncCtx = ctx
+      startTestOutputCapture(ctx)
+      installChroniclesTestOutput()
 
-    template fail(prefix: string, eClass: string, e: auto): untyped =
-      let eName = "[" & $e.name & "]"
-      checkpoint(prefix & "Unhandled " & eClass & ": " & e.msg & " " & eName)
-      var stackTrace {.inject.} = e.getStackTrace()
-      fail()
+      let suiteName {.inject, used.} = asyncSuiteName
+      let testName {.inject, used.} = asyncTestName
+      template testStatusIMPL: var TestStatus {.inject, used.} = ctx.status
 
-    template failingOnExceptions(prefix: string, code: untyped): untyped =
-      when NimMajor>=2:
-        {.push warning[UnnamedBreak]:off.}
-      try:
-        block:
-          code
-      except CatchableError as e:
-        prefix.fail("error", e)
-      except Defect as e: # This may or may not work dependings on --panics
-        prefix.fail("defect", e)
-      except Exception as e:
-        prefix.fail("exception that may cause undefined behavior", e)
-      when NimMajor>=2:
-        {.pop.}
+      template fail(prefix: string, eClass: string, e: auto): untyped =
+        let eName = "[" & $e.name & "]"
+        checkpoint(prefix & "Unhandled " & eClass & ": " & e.msg & " " & eName)
+        var stackTrace {.inject.} = e.getStackTrace()
+        fail()
 
-    failingOnExceptions("[setup] "):
-      when declared(testSetupIMPLFlag): testSetupIMPL()
-      defer: failingOnExceptions("[teardown] "):
-        when declared(testTeardownIMPLFlag): testTeardownIMPL()
-      failingOnExceptions(""):
-        when not unittest2ListTests:
-          body
+      # Use the same failingOnExceptions pattern as the sync version so that
+      # {.inject.} variables from setup are visible in body and teardown.
+      template failAsyncOnExceptions(prefix: string, code: untyped): untyped =
+        when NimMajor >= 2: {.push warning[UnnamedBreak]: off.}
+        try:
+          block:
+            code
+        except CatchableError as e: prefix.fail("error", e)
+        except Defect as e:         prefix.fail("defect", e)
+        except Exception as e:      prefix.fail("exception that may cause undefined behavior", e)
+        when NimMajor >= 2: {.pop.}
 
-    checkpoints = @[]
+      failAsyncOnExceptions("[setup] "):
+        when declared(testSetupIMPLFlag): testSetupIMPL()
+        failAsyncOnExceptions(""):
+          when not unittest3ListTests:
+            body  # await is valid here; setup-injected vars are in scope
+        failAsyncOnExceptions("[teardown] "):
+          when declared(testTeardownIMPLFlag): testTeardownIMPL()
 
-    testStatus
+      let output = finishTestOutputCapture(ctx)
+      currentAsyncCtx = nil
+    TestRunResult(status: ctx.status, output: output)
 
   let
     localSuiteName =
@@ -1167,9 +1299,9 @@ template runtimeTest*(nameParam: string, body: untyped) =
     let
       instance =
         Test(
-          testName: localTestName, 
-          suiteName: localSuiteName, 
-          impl: runTest,
+          testName: localTestName,
+          suiteName: localSuiteName,
+          asyncImpl: runTestAsync,
           lineInfo: instantiationInfo().line,
           filename: instantiationInfo().filename
         )
@@ -1177,27 +1309,6 @@ template runtimeTest*(nameParam: string, body: untyped) =
       tests.mgetOrPut(localSuiteName, default(seq[Test])).add(instance)
     else:
       runDirect(instance)
-
-template staticTest*(nameParam: string, body: untyped) =
-  ## Similar to `test` but runs only at compiletime, no matter the
-  ## `unittest2Static` flag
-  static:
-    block:
-      echo "[Test   ] ", nameParam
-      body
-      echo "[", TestStatus.OK, "     ] ", nameParam
-    {.cast(gcsafe).}:
-      reset checkpointsVm
-
-template dualTest*(nameParam: string, body: untyped) =
-  ## Similar to `test` but run the test both compuletime and run time, no
-  ## matter the `unittest2Static` flag
-  staticTest nameParam:
-    when not unittest2ListTests:
-      body
-  runtimeTest nameParam:
-    when not unittest2ListTests:
-      body
 
 template test*(nameParam: string, body: untyped) =
   ## Define a single test case identified by `name`.
@@ -1213,24 +1324,19 @@ template test*(nameParam: string, body: untyped) =
   ## .. code-block::
   ##
   ##  [OK] roses are red
-  when nimvm:
-    when unittest2Static:
-      staticTest nameParam:
-        when not unittest2ListTests:
-          body
   runtimeTest nameParam:
-    when not unittest2ListTests:
+    when not unittest3ListTests:
       body
 
 {.pop.} # raises: []
 
-iterator unittest2EvalOnceIter[T](x: T): auto =
+iterator unittest3EvalOnceIter[T](x: T): auto =
   yield x
-iterator unittest2EvalOnceIter[T](x: var T): var T =
+iterator unittest3EvalOnceIter[T](x: var T): var T =
   yield x
 
-template unittest2EvalOnce(name: untyped, param: typed, blk: untyped) =
-  for name in unittest2EvalOnceIter(param):
+template unittest3EvalOnce(name: untyped, param: typed, blk: untyped) =
+  for name in unittest3EvalOnceIter(param):
     blk
 
 macro check*(conditions: untyped): untyped =
@@ -1263,7 +1369,7 @@ macro check*(conditions: untyped): untyped =
     result.printOuts = newNimNode(nnkStmtList)
 
     var counter = 0
-    let evalOnce = bindSym("unittest2EvalOnce")
+    let evalOnce = bindSym("unittest3EvalOnce")
     result.frame = result.inner
     if exp[0].kind in {nnkIdent, nnkOpenSymChoice, nnkClosedSymChoice, nnkSym} and
         $exp[0] in ["not", "in", "notin", "==", "<=",
@@ -1357,14 +1463,11 @@ template require*(conditions: untyped) =
   ## Same as `check` except any failed test causes the program to quit
   ## immediately. Any teardown statements are not executed and the failed
   ## test output is not generated.
-  when nimvm:
+  let savedAbortOnError = abortOnError
+  block:
+    abortOnError = true
     check conditions
-  else:
-    let savedAbortOnError = abortOnError
-    block:
-      abortOnError = true
-      check conditions
-    abortOnError = savedAbortOnError
+  abortOnError = savedAbortOnError
 
 macro expect*(exceptions: varargs[typed], body: untyped): untyped =
   ## Test if `body` raises an exception found in the passed `exceptions`.
@@ -1407,10 +1510,10 @@ macro expect*(exceptions: varargs[typed], body: untyped): untyped =
   result = getAst(expectBody(errorTypes, errorTypes.lineInfo, body))
 
 proc disableParamFiltering* {.deprecated:
-    "Compile with -d:unittest2DisableParamFiltering instead".} =
+    "Compile with -d:unittest3DisableParamFiltering instead".} =
   discard
 
-when unittest2PreviewIsolate:
+when unittest3PreviewIsolate:
   import std/[osproc, strtabs]
   proc runIsolated(test: Test) =
     # Run test in an isolated process - this has the advantage that we can
@@ -1425,14 +1528,14 @@ when unittest2PreviewIsolate:
     # * simple to parallelise
     # * we can abort long-running tests after a timeout
 
-    let startTime = getMonoTime()
+    let startTime = Moment.now()
     testStarted(test.testName)
 
     let runner = startProcess(
       getAppFilename2(),
       args = [test.suiteName & "::" & test.testName],
       env = newStringTable(
-        "UNITTEST2_ISOLATED", "1",
+        "unittest3_ISOLATED", "1",
         StringTableMode.modeCaseSensitive),
       options = {poStdErrToStdOut})
 
@@ -1459,7 +1562,7 @@ when unittest2PreviewIsolate:
       suiteName: test.suiteName,
       testName: test.testName,
       status: if status == 0: TestStatus.OK else: TestStatus.FAILED,
-      duration: getMonoTime() - startTime,
+      duration: Moment.now() - startTime,
       output: output
     ))
 
@@ -1492,12 +1595,93 @@ when unittest2PreviewIsolate:
       echo("\n")
 
 when collect:
+  proc runAsync(test: Test) {.async.} =
+    let startTime = Moment.now()
+    noteTestExecution(test.suiteName, test.testName)
+    testStarted(test.testName)
+    var testRunResult = TestRunResult(status: TestStatus.FAILED)
+    try:
+      {.cast(gcsafe).}:
+        testRunResult = await test.asyncImpl(test.suiteName, test.testName)
+    except Exception as e:
+      discard e  # asyncImpl catches all exceptions internally; status already set
+    
+    testEnded(TestResult(
+      suiteName: test.suiteName,
+      testName: test.testName,
+      status: testRunResult.status,
+      duration: Moment.now() - startTime,
+      output: testRunResult.output
+    ))
+
+  proc runScheduledTestsAsync(
+      tmp: OrderedTable[string, seq[Test]]
+  ) {.async.} =
+    type InflightEntry = tuple[fut: FutureBase, suiteName: string]
+    var
+      allTests: seq[tuple[suiteName: string, test: Test]]
+      suiteTotals: Table[string, int]
+      suiteDone: Table[string, int]
+      suiteBegun: HashSet[string]
+      inflight: seq[InflightEntry]
+      idx = 0
+
+    for sn, suite in tmp:
+      if suite.len == 0: continue
+      suiteTotals[sn] = suite.len
+      for t in suite:
+        allTests.add((sn, t))
+
+    const LOW = unittest3LowWatermark
+    const HIGH = unittest3HighWatermark
+
+    while idx < allTests.len or inflight.len > 0:
+      # Reap completed futures; signal suiteEnded when last test of suite finishes
+      var nextInflight: seq[InflightEntry]
+      for entry in inflight:
+        if entry.fut.finished:
+          let done = suiteDone.getOrDefault(entry.suiteName, 0) + 1
+          suiteDone[entry.suiteName] = done
+          if done == suiteTotals.getOrDefault(entry.suiteName, 0):
+            suiteEnded()
+        else:
+          nextInflight.add(entry)
+      inflight = nextInflight
+
+      # Launch new tests up to HIGH watermark
+      while idx < allTests.len and inflight.len < HIGH:
+        let (sn, t) = allTests[idx]
+        if sn notin suiteBegun:
+          suiteStarted(sn)
+          suiteBegun.incl(sn)
+        inflight.add((FutureBase(runAsync(t)), sn))
+        inc idx
+
+      if inflight.len == 0:
+        break
+
+      if inflight.len >= HIGH or idx >= allTests.len:
+        # At capacity or all tests launched: wait for one to finish
+        try:
+          discard await chronos.race(inflight.mapIt(it.fut))
+        except ValueError:
+          discard  # inflight is non-empty so this should not fire
+        except CancelledError:
+          break
+      elif inflight.len >= LOW:
+        # Enough tests running: yield briefly to let blocked tests progress
+        try:
+          await chronos.sleepAsync(chronos.ZeroDuration)
+        except CancelledError:
+          break
+      # else: inflight < LOW — keep filling without yielding
+
   proc runScheduledTests() {.noconv.} =
     # Tests can be added inside tests - this is weird and only partially
     # supported
     while tests.len > 0:
       var tmp = move(tests)
-      when unittest2ListTests:
+      when unittest3ListTests:
         for suiteName, suite in tmp:
           if suite.len == 0: continue
           echo "Suite: ", suiteName
@@ -1506,23 +1690,20 @@ when collect:
             echo "\tFile: ", test.filename, ":", test.lineInfo
       else:
         suiteRunStarted(tmp)
-        for suiteName, suite in tmp:
-          if suite.len == 0: continue
-
-          suiteStarted(suiteName)
-          for test in suite:
-            when isolate:
+        when isolate:
+          for suiteName, suite in tmp:
+            if suite.len == 0: continue
+            suiteStarted(suiteName)
+            for test in suite:
               if not isolated:
                 runIsolated(test)
               else:
                 runDirect(test)
-            else:
-              runDirect(test)
-
-          suiteEnded()
-
+            suiteEnded()
+        else:
+          waitFor(runScheduledTestsAsync(tmp))
         suiteRunEnded()
-    when not unittest2ListTests:
+    when not unittest3ListTests:
       testRunEnded()
 
   addExitProc(runScheduledTests)
