@@ -110,8 +110,10 @@
 ##       echo "suite teardown: run once after the tests"
 
 import std/[macros, sequtils, sets, strutils, streams, tables]
-import chronos
-export chronos
+import chronos except await
+export chronos except await
+import chronicles
+export chronicles
 
 when defined(nimHasWarnBareExcept):
   # In unit tests, we want to at least attempt to catch Exception no matter its
@@ -122,6 +124,9 @@ when defined(nimHasWarnBareExcept):
 
 when declared(stdout):
   import std/os
+
+when declared(stdout) and defined(posix):
+  import std/posix
 
 const useTerminal = declared(stdout) and not defined(js)
 
@@ -201,7 +206,7 @@ type
   Test = object
     suiteName: string
     testName: string
-    asyncImpl: proc(suite, name: string): Future[TestStatus]
+    asyncImpl: proc(suite, name: string): Future[TestRunResult]
     lineInfo: int
     filename: string
 
@@ -209,6 +214,10 @@ type
     OK,
     FAILED,
     SKIPPED
+
+  TestRunResult = object
+    status: TestStatus
+    output: string
 
   TestResult* = object
     suiteName*: string
@@ -278,6 +287,9 @@ type
     ## `checkpoints` being corrupted when tests interleave at `await` points.
     status: TestStatus
     checkpoints: seq[string]
+    outputPath: string
+    outputFile: File
+    outputCaptureEnabled: bool
 
 # TODO these globals are threadvar so as to avoid gc-safety-issues - this should
 #      probably be resolved in a better way down the line specially since we
@@ -300,6 +312,167 @@ var
     ## Points to the currently-executing async test's context. Nil outside async tests.
     ## Because chronos is single-threaded cooperative, only one test runs between
     ## await points, so this pointer is always valid for the active test.
+  stdoutCaptureCounter {.threadvar.}: int
+
+when declared(stdout) and defined(posix):
+  var
+    savedStdoutFd {.threadvar.}: cint
+    savedStderrFd {.threadvar.}: cint
+
+  proc ensureSavedOutputFds() =
+    if savedStdoutFd <= 0:
+      try:
+        savedStdoutFd = dup(cint(stdout.getFileHandle()))
+      except CatchableError:
+        savedStdoutFd = 0
+    if savedStderrFd <= 0:
+      try:
+        savedStderrFd = dup(cint(stderr.getFileHandle()))
+      except CatchableError:
+        savedStderrFd = 0
+
+  proc redirectFileTo(f: File, fd: cint) =
+    try:
+      f.flushFile()
+    except CatchableError:
+      discard
+    if fd >= 0:
+      discard dup2(fd, cint(f.getFileHandle()))
+
+  proc restoreStdoutCapture() =
+    ensureSavedOutputFds()
+    redirectFileTo(stdout, savedStdoutFd)
+    redirectFileTo(stderr, savedStderrFd)
+
+  proc activateStdoutCapture(ctx: AsyncTestContext) =
+    if ctx != nil and ctx.outputCaptureEnabled:
+      let fd = cint(ctx.outputFile.getFileHandle())
+      redirectFileTo(stdout, fd)
+      redirectFileTo(stderr, fd)
+
+  proc appendTestOutput(ctx: AsyncTestContext, output: string) =
+    if ctx != nil and ctx.outputCaptureEnabled:
+      try:
+        ctx.outputFile.write(output)
+        if output.len == 0 or output[^1] != '\n':
+          ctx.outputFile.write("\n")
+        ctx.outputFile.flushFile()
+      except CatchableError:
+        discard
+    else:
+      try:
+        stdout.write(output)
+        if output.len == 0 or output[^1] != '\n':
+          stdout.write("\n")
+        stdout.flushFile()
+      except CatchableError:
+        discard
+
+  proc suspendTestOutputCapture() =
+    restoreStdoutCapture()
+
+  proc resumeTestOutputCapture() =
+    activateStdoutCapture(currentAsyncCtx)
+
+  proc startTestOutputCapture(ctx: AsyncTestContext) =
+    ensureSavedOutputFds()
+    if savedStdoutFd <= 0 or savedStderrFd <= 0:
+      return
+
+    try:
+      inc stdoutCaptureCounter
+      ctx.outputPath = getTempDir() / (
+        "unittest3-stdout-" & $getCurrentProcessId() & "-" &
+        $stdoutCaptureCounter & ".out")
+      if open(ctx.outputFile, ctx.outputPath, fmWrite):
+        ctx.outputCaptureEnabled = true
+        activateStdoutCapture(ctx)
+    except CatchableError:
+      ctx.outputCaptureEnabled = false
+
+  proc finishTestOutputCapture(ctx: AsyncTestContext): string =
+    if ctx == nil or not ctx.outputCaptureEnabled:
+      return ""
+
+    try:
+      ctx.outputFile.flushFile()
+    except CatchableError:
+      discard
+
+    restoreStdoutCapture()
+
+    try:
+      ctx.outputFile.close()
+    except CatchableError:
+      discard
+
+    try:
+      result = readFile(ctx.outputPath)
+    except CatchableError:
+      result = ""
+
+    try:
+      removeFile(ctx.outputPath)
+    except CatchableError:
+      discard
+
+    ctx.outputCaptureEnabled = false
+else:
+  proc appendTestOutput(ctx: AsyncTestContext, output: string) =
+    discard
+  proc suspendTestOutputCapture() = discard
+  proc resumeTestOutputCapture() = discard
+  proc startTestOutputCapture(ctx: AsyncTestContext) = discard
+  proc finishTestOutputCapture(ctx: AsyncTestContext): string = ""
+
+proc chroniclesTestOutputWriter(logLevel: LogLevel, logRecord: LogOutputStr) {.
+    gcsafe, used.} =
+  discard logLevel
+  {.cast(gcsafe).}:
+    appendTestOutput(currentAsyncCtx, string(logRecord))
+
+template installChroniclesTestOutput() {.dirty.} =
+  bind chroniclesTestOutputWriter
+  mixin defaultChroniclesStream
+  when declared(defaultChroniclesStream):
+    when compiles(defaultChroniclesStream.outputs[0].writer = chroniclesTestOutputWriter):
+      defaultChroniclesStream.outputs[0].writer = chroniclesTestOutputWriter
+    when compiles(defaultChroniclesStream.outputs[1].writer = chroniclesTestOutputWriter):
+      defaultChroniclesStream.outputs[1].writer = chroniclesTestOutputWriter
+    when compiles(defaultChroniclesStream.outputs[2].writer = chroniclesTestOutputWriter):
+      defaultChroniclesStream.outputs[2].writer = chroniclesTestOutputWriter
+    when compiles(defaultChroniclesStream.outputs[3].writer = chroniclesTestOutputWriter):
+      defaultChroniclesStream.outputs[3].writer = chroniclesTestOutputWriter
+
+template await*[T](f: Future[T]): T =
+  let unittest3AwaitCtx = currentAsyncCtx
+  suspendTestOutputCapture()
+  when T is void:
+    chronos.await(f)
+    {.cast(gcsafe).}:
+      currentAsyncCtx = unittest3AwaitCtx
+    resumeTestOutputCapture()
+  else:
+    let unittest3AwaitResult = chronos.await(f)
+    {.cast(gcsafe).}:
+      currentAsyncCtx = unittest3AwaitCtx
+    resumeTestOutputCapture()
+    unittest3AwaitResult
+
+template await*[T, E](f: InternalRaisesFuture[T, E]): T =
+  let unittest3AwaitCtx = currentAsyncCtx
+  suspendTestOutputCapture()
+  when T is void:
+    chronos.await(f)
+    {.cast(gcsafe).}:
+      currentAsyncCtx = unittest3AwaitCtx
+    resumeTestOutputCapture()
+  else:
+    let unittest3AwaitResult = chronos.await(f)
+    {.cast(gcsafe).}:
+      currentAsyncCtx = unittest3AwaitCtx
+    resumeTestOutputCapture()
+    unittest3AwaitResult
 
 when collect:
   var
@@ -579,6 +752,20 @@ proc printFailureInfo(formatter: ConsoleOutputFormatter, testResult: TestResult)
   if testResult.errors.len > 0:
     echo testResult.errors
 
+proc printCapturedOutput(formatter: ConsoleOutputFormatter, output: string) =
+  if output.len == 0:
+    return
+
+  if formatter.outputLevel == COMPACT:
+    echo ""
+
+  try:
+    stdout.write(output)
+    if output[^1] != '\n':
+      echo ""
+  except CatchableError:
+    discard
+
 proc printTestResultStatus(formatter: ConsoleOutputFormatter, testResult: TestResult) =
   let
     status = formatStatus(testResult.status)
@@ -606,6 +793,10 @@ method testEnded*(formatter: ConsoleOutputFormatter, testResult: TestResult) =
   var testResult = testResult
   testResult.errors = move(formatter.errors)
 
+  if formatter.outputLevel == COMPACT and testResult.output.len > 0:
+    formatter.printCapturedOutput(testResult.output)
+    testResult.output.reset()
+
   formatter.results.add(testResult)
 
   if formatter.outputLevel == VERBOSE and testResult.status == TestStatus.FAILED:
@@ -615,6 +806,8 @@ method testEnded*(formatter: ConsoleOutputFormatter, testResult: TestResult) =
   if formatter.outputLevel in {VERBOSE, FAILURES}:
     if testResult.status == TestStatus.FAILED:
       printFailureInfo(formatter, testResult)
+    elif formatter.outputLevel == VERBOSE:
+      formatter.printCapturedOutput(testResult.output)
     if formatter.outputLevel == VERBOSE or testResult.status == TestStatus.FAILED:
       printTestResultStatus(formatter, testResult)
   else:
@@ -1122,11 +1315,13 @@ template runtimeTest*(nameParam: string, body: untyped) =
   ## setting
   bind collect, shouldRun, checkpoints
 
-  proc runTestAsync(asyncSuiteName, asyncTestName: string): Future[TestStatus] {.
+  proc runTestAsync(asyncSuiteName, asyncTestName: string): Future[TestRunResult] {.
       async, gcsafe, gensym.} =
     let ctx = AsyncTestContext(status: TestStatus.OK, checkpoints: @[])
     {.cast(gcsafe).}:
       currentAsyncCtx = ctx
+      startTestOutputCapture(ctx)
+      installChroniclesTestOutput()
 
       let suiteName {.inject, used.} = asyncSuiteName
       let testName {.inject, used.} = asyncTestName
@@ -1158,8 +1353,9 @@ template runtimeTest*(nameParam: string, body: untyped) =
         failAsyncOnExceptions("[teardown] "):
           when declared(testTeardownIMPLFlag): testTeardownIMPL()
 
+      let output = finishTestOutputCapture(ctx)
       currentAsyncCtx = nil
-    ctx.status
+    TestRunResult(status: ctx.status, output: output)
 
   let
     localSuiteName =
@@ -1503,18 +1699,19 @@ when collect:
   proc runAsync(test: Test) {.async.} =
     let startTime = Moment.now()
     testStarted(test.testName)
-    var status = TestStatus.FAILED
+    var testRunResult = TestRunResult(status: TestStatus.FAILED)
     try:
       {.cast(gcsafe).}:
-        status = await test.asyncImpl(test.suiteName, test.testName)
+        testRunResult = await test.asyncImpl(test.suiteName, test.testName)
     except Exception as e:
       discard e  # asyncImpl catches all exceptions internally; status already set
     
     testEnded(TestResult(
       suiteName: test.suiteName,
       testName: test.testName,
-      status: status,
-      duration: Moment.now() - startTime
+      status: testRunResult.status,
+      duration: Moment.now() - startTime,
+      output: testRunResult.output
     ))
 
   proc runScheduledTestsAsync(

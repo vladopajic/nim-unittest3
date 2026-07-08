@@ -48,6 +48,7 @@ task test, "Run tests":
 task buildDocs, "Build docs":
   exec "nim doc --skipParentCfg:on --skipUserCfg:on --outdir:docs --git.url:https://github.com/status-im/nim-unittest3 --git.commit:master --git.devel:master unittest3.nim"
 # begin Nimble config (version 2)
+--noNimblePath
 when withDir(thisDir(), system.fileExists("nimble.paths")):
   include "nimble.paths"
 # end Nimble config
