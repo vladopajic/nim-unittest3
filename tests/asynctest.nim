@@ -53,3 +53,24 @@ suite "Async Expected Failure":
     check exitCode == 0
     check output.contains("[FAILED ]")
     check output.contains("check false")
+
+  test "slow async child test fails on timeout":
+    let childPath = "build" / "async_expected_timeout.nim"
+    createDir childPath.splitFile.dir
+    writeFile(childPath, """
+import ../unittest3
+
+suite "Async Expected Timeout":
+  test "sleep exceeds configured timeout":
+    await sleepAsync(1500.milliseconds)
+    check true
+""")
+
+    let (output, exitCode) = execCmdEx(
+      "nim c --threads:on -d:unittest3TestTimeoutSeconds=1 -r " &
+      quoteShell(childPath) & " --output-level=COMPACT"
+    )
+
+    check exitCode == 0
+    check output.contains("[FAILED ]")
+    check output.contains("[TIMEOUT]")

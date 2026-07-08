@@ -71,10 +71,15 @@ const
   unittest3HighWatermark* {.intdefine.} = 8
     ## Maximum number of concurrent tests in flight.
     ## New tests are not started until a running test completes.
+  unittest3TestTimeoutSeconds* {.intdefine.} = 60
+    ## Maximum duration for a single test.
+    ## Set to 0 to disable per-test timeout enforcement.
 
 static:
   doAssert unittest3LowWatermark <= unittest3HighWatermark,
     "unittest3LowWatermark must be <= unittest3HighWatermark"
+  doAssert unittest3TestTimeoutSeconds >= 0,
+    "unittest3TestTimeoutSeconds must be >= 0"
 
 when useTerminal:
   import std/terminal
@@ -1602,7 +1607,33 @@ when collect:
     var testRunResult = TestRunResult(status: TestStatus.FAILED)
     try:
       {.cast(gcsafe).}:
-        testRunResult = await test.asyncImpl(test.suiteName, test.testName)
+        let testFuture = test.asyncImpl(test.suiteName, test.testName)
+        when unittest3TestTimeoutSeconds == 0:
+          testRunResult = await testFuture
+        else:
+          let testTimeout = unittest3TestTimeoutSeconds.seconds
+          let timeoutFuture = chronos.sleepAsync(testTimeout)
+          discard await chronos.race(@[FutureBase(testFuture), FutureBase(timeoutFuture)])
+
+          if timeoutFuture.finished() and not testFuture.finished():
+            testFuture.cancelSoon()
+            discard await testFuture.withTimeout(1.seconds)
+            testRunResult = TestRunResult(
+              status: TestStatus.FAILED,
+              output:
+                "[TIMEOUT] Test exceeded timeout of " &
+                $unittest3TestTimeoutSeconds & " seconds.\n"
+            )
+          else:
+            if not timeoutFuture.finished():
+              await timeoutFuture.cancelAndWait()
+            if testFuture.finished() and not testFuture.cancelled():
+              testRunResult = testFuture.read()
+            else:
+              testRunResult = TestRunResult(
+                status: TestStatus.FAILED,
+                output: "Test future was cancelled.\n"
+              )
     except Exception as e:
       discard e  # asyncImpl catches all exceptions internally; status already set
     
