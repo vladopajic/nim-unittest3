@@ -1737,6 +1737,8 @@ when collect:
       suiteDone: Table[string, int]
       suiteBegun: HashSet[string]
       inflight: seq[InflightEntry]
+      raceFutures: seq[FutureBase]
+      serialActive = false
       idx = 0
 
     for sn, suite in tmp:
@@ -1746,24 +1748,30 @@ when collect:
         allTests.add((sn, t))
 
     let jobLimit = getRuntimeJobs()
+    raceFutures = newSeqOfCap[FutureBase](jobLimit)
 
     while idx < allTests.len or inflight.len > 0:
       # Reap completed futures; signal suiteEnded when last test of suite finishes
-      var nextInflight: seq[InflightEntry]
-      for entry in inflight:
+      var writeIdx = 0
+      serialActive = false
+      for readIdx in 0 ..< inflight.len:
+        let entry = inflight[readIdx]
         if entry.fut.finished:
           let done = suiteDone.getOrDefault(entry.suiteName, 0) + 1
           suiteDone[entry.suiteName] = done
           if done == suiteTotals.getOrDefault(entry.suiteName, 0):
             suiteEnded()
         else:
-          nextInflight.add(entry)
-      inflight = nextInflight
+          if writeIdx != readIdx:
+            inflight[writeIdx] = entry
+          inc writeIdx
+          serialActive = serialActive or entry.serial
+      inflight.setLen(writeIdx)
 
       # Launch new tests up to the configured job limit.
       var blockedBySerial = false
       while idx < allTests.len and inflight.len < jobLimit:
-        if inflight.anyIt(it.serial):
+        if serialActive:
           blockedBySerial = true
           break
 
@@ -1778,6 +1786,7 @@ when collect:
         inflight.add((FutureBase(runAsync(t)), sn, t.serial))
         inc idx
         if t.serial:
+          serialActive = true
           break
 
       if inflight.len == 0:
@@ -1786,7 +1795,10 @@ when collect:
       if blockedBySerial or inflight.len >= jobLimit or idx >= allTests.len:
         # At capacity or all tests launched: wait for one to finish
         try:
-          discard await chronos.race(inflight.mapIt(it.fut))
+          raceFutures.setLen(0)
+          for entry in inflight:
+            raceFutures.add(entry.fut)
+          discard await chronos.race(raceFutures)
         except ValueError:
           discard # inflight is non-empty so this should not fire
         except CancelledError:
