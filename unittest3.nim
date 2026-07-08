@@ -250,6 +250,7 @@ type
     curSuite: int
     curTestName: string
     curTest: int
+    compactLineOpen: bool
 
     statuses: array[TestStatus, int]
 
@@ -280,6 +281,8 @@ type
   AsyncTestContext = ref object
     ## Per-test state for async execution. Avoids shared global `testStatus` /
     ## `checkpoints` being corrupted when tests interleave at `await` points.
+    suiteName: string
+    testName: string
     status: TestStatus
     checkpoints: seq[string]
     outputPath: string
@@ -307,6 +310,8 @@ var
     ## Because chronos is single-threaded cooperative, only one test runs between
     ## await points, so this pointer is always valid for the active test.
   stdoutCaptureCounter {.threadvar.}: int
+  lastExecutedSuite {.threadvar.}: string
+  lastExecutedTest {.threadvar.}: string
 
 when declared(stdout) and defined(posix):
   var
@@ -438,6 +443,8 @@ template installChroniclesTestOutput() {.dirty.} =
     when compiles(defaultChroniclesStream.outputs[3].writer = chroniclesTestOutputWriter):
       defaultChroniclesStream.outputs[3].writer = chroniclesTestOutputWriter
 
+proc noteTestExecution(suiteName, testName: string) {.gcsafe.}
+
 template await*[T](f: Future[T]): T =
   let unittest3AwaitCtx = currentAsyncCtx
   suspendTestOutputCapture()
@@ -445,11 +452,15 @@ template await*[T](f: Future[T]): T =
     chronos.await(f)
     {.cast(gcsafe).}:
       currentAsyncCtx = unittest3AwaitCtx
+    if unittest3AwaitCtx != nil:
+      noteTestExecution(unittest3AwaitCtx.suiteName, unittest3AwaitCtx.testName)
     resumeTestOutputCapture()
   else:
     let unittest3AwaitResult = chronos.await(f)
     {.cast(gcsafe).}:
       currentAsyncCtx = unittest3AwaitCtx
+    if unittest3AwaitCtx != nil:
+      noteTestExecution(unittest3AwaitCtx.suiteName, unittest3AwaitCtx.testName)
     resumeTestOutputCapture()
     unittest3AwaitResult
 
@@ -460,11 +471,15 @@ template await*[T, E](f: InternalRaisesFuture[T, E]): T =
     chronos.await(f)
     {.cast(gcsafe).}:
       currentAsyncCtx = unittest3AwaitCtx
+    if unittest3AwaitCtx != nil:
+      noteTestExecution(unittest3AwaitCtx.suiteName, unittest3AwaitCtx.testName)
     resumeTestOutputCapture()
   else:
     let unittest3AwaitResult = chronos.await(f)
     {.cast(gcsafe).}:
       currentAsyncCtx = unittest3AwaitCtx
+    if unittest3AwaitCtx != nil:
+      noteTestExecution(unittest3AwaitCtx.suiteName, unittest3AwaitCtx.testName)
     resumeTestOutputCapture()
     unittest3AwaitResult
 
@@ -487,6 +502,9 @@ when collect:
 method suiteStarted*(formatter: OutputFormatter, suiteName: string) {.base, gcsafe.} =
   discard
 method testStarted*(formatter: OutputFormatter, testName: string) {.base, gcsafe.} =
+  discard
+method testExecutionSwitched*(
+    formatter: OutputFormatter, suiteName, testName: string) {.base, gcsafe.} =
   discard
 method failureOccurred*(formatter: OutputFormatter, checkpoints: seq[string],
     stackTrace: string) {.base, gcsafe.} =
@@ -519,6 +537,18 @@ proc suiteStarted(name: string) =
 proc testStarted(name: string) =
   for formatter in formatters:
     formatter.testStarted(name)
+
+proc testExecutionSwitched(suiteName, testName: string) {.gcsafe.} =
+  for formatter in formatters:
+    formatter.testExecutionSwitched(suiteName, testName)
+
+proc noteTestExecution(suiteName, testName: string) {.gcsafe.} =
+  if lastExecutedSuite.len > 0 and
+      (lastExecutedSuite != suiteName or lastExecutedTest != testName):
+    testExecutionSwitched(suiteName, testName)
+
+  lastExecutedSuite = suiteName
+  lastExecutedTest = testName
 
 proc testEnded(testResult: TestResult) =
   for formatter in formatters:
@@ -668,11 +698,17 @@ method suiteStarted*(formatter: ConsoleOutputFormatter, suiteName: string) =
         if formatter.outputLevel == VERBOSE: formatStatus("Suite") & " " else: ""
     maxNameLen = when collect: max(toSeq(formatter.tests.keys()).mapIt(it.len)) else: 0
     eol = if formatter.outputLevel == VERBOSE: "\n" else: " "
+  if formatter.outputLevel == COMPACT and formatter.compactLineOpen:
+    echo ""
+    formatter.compactLineOpen = false
+
   formatter.write do:
     stdout.styledWrite(styleBright, fgBlue, counter, alignLeft(suiteName, maxNameLen), eol)
   do:
     stdout.write(counter, alignLeft(suiteName, maxNameLen), eol)
   stdout.flushFile()
+  if formatter.outputLevel == COMPACT:
+    formatter.compactLineOpen = true
 
 proc writeTestName(formatter: ConsoleOutputFormatter, testName: string) =
   formatter.write do:
@@ -705,6 +741,21 @@ method testStarted*(formatter: ConsoleOutputFormatter, testName: string) =
 
   writeTestName(formatter, testName)
   echo ""
+
+method testExecutionSwitched*(
+    formatter: ConsoleOutputFormatter, suiteName, testName: string) =
+  discard suiteName
+  discard testName
+
+  if formatter.outputLevel != COMPACT:
+    return
+
+  formatter.write do:
+    stdout.styledWrite styleBright, fgGreen, "."
+  do:
+    stdout.write "."
+  stdout.flushFile()
+  formatter.compactLineOpen = true
 
 method failureOccurred*(formatter: ConsoleOutputFormatter,
                         checkpoints: seq[string], stackTrace: string) =
@@ -752,11 +803,13 @@ proc printCapturedOutput(formatter: ConsoleOutputFormatter, output: string) =
 
   if formatter.outputLevel == COMPACT:
     echo ""
+    formatter.compactLineOpen = false
 
   try:
     stdout.write(output)
     if output[^1] != '\n':
       echo ""
+    formatter.compactLineOpen = false
   except CatchableError:
     discard
 
@@ -820,6 +873,7 @@ method testEnded*(formatter: ConsoleOutputFormatter, testResult: TestResult) =
     do:
       stdout.write marker
     stdout.flushFile()
+    formatter.compactLineOpen = true
 
 method suiteEnded*(formatter: ConsoleOutputFormatter) =
   if formatter.outputLevel == OutputLevel.NONE:
@@ -840,12 +894,14 @@ method suiteEnded*(formatter: ConsoleOutputFormatter) =
         echo ""
       do:
         echo(" ", totalDurStr)
+      formatter.compactLineOpen = false
     else:
       formatter.write do:
         # If no tests were run, remove the suite name
         stdout.eraseLine()
       do:
         stdout.writeLine("")
+      formatter.compactLineOpen = false
 
   var failed = false
   if formatter.outputLevel notin {VERBOSE, FAILURES}:
@@ -1284,7 +1340,11 @@ template runtimeTest*(nameParam: string, body: untyped) =
 
   proc runTestAsync(asyncSuiteName, asyncTestName: string): Future[TestRunResult] {.
       async, gcsafe, gensym.} =
-    let ctx = AsyncTestContext(status: TestStatus.OK, checkpoints: @[])
+    let ctx = AsyncTestContext(
+      suiteName: asyncSuiteName,
+      testName: asyncTestName,
+      status: TestStatus.OK,
+      checkpoints: @[])
     {.cast(gcsafe).}:
       currentAsyncCtx = ctx
       startTestOutputCapture(ctx)
@@ -1636,6 +1696,7 @@ when unittest3PreviewIsolate:
 when collect:
   proc runAsync(test: Test) {.async.} =
     let startTime = Moment.now()
+    noteTestExecution(test.suiteName, test.testName)
     testStarted(test.testName)
     var testRunResult = TestRunResult(status: TestStatus.FAILED)
     try:
