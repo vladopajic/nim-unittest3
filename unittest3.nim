@@ -11,8 +11,8 @@
 {.push raises: [].}
 
 import std/[macros, sequtils, sets, strutils, streams, tables]
-import chronos except await
-export chronos except await
+import chronos
+export chronos
 import chronicles
 export chronicles
 
@@ -179,7 +179,7 @@ type
     suites: seq[JUnitSuite]
     currentSuite: int
 
-  AsyncTestContext = ref object
+  AsyncTestContext = ref object of RootObj
     ## Per-test state for async execution. Avoids shared global `testStatus` /
     ## `checkpoints` being corrupted when tests interleave at `await` points.
     suiteName: string
@@ -209,13 +209,19 @@ var
   currentSuiteSerial {.threadvar.}: bool
   currentTestSerial {.threadvar.}: bool
   testStatus {.threadvar.}: TestStatus
-  currentAsyncCtx {.threadvar.}: AsyncTestContext
-    ## Points to the currently-executing async test's context. Nil outside async tests.
-    ## Because chronos is single-threaded cooperative, only one test runs between
-    ## await points, so this pointer is always valid for the active test.
   stdoutCaptureCounter {.threadvar.}: int
   lastExecutedSuite {.threadvar.}: string
   lastExecutedTest {.threadvar.}: string
+
+proc currentAsyncCtxImpl(): AsyncTestContext {.gcsafe, raises: [].} =
+  let ctx = currentTaskLocalContext()
+  if ctx != nil and ctx of AsyncTestContext:
+    AsyncTestContext(ctx)
+  else:
+    nil
+
+template currentAsyncCtx: AsyncTestContext =
+  currentAsyncCtxImpl()
 
 when declared(stdout) and defined(posix):
   var
@@ -274,9 +280,6 @@ when declared(stdout) and defined(posix):
   proc suspendTestOutputCapture() =
     restoreStdoutCapture()
 
-  proc resumeTestOutputCapture() =
-    activateStdoutCapture(currentAsyncCtx)
-
   proc startTestOutputCapture(ctx: AsyncTestContext) =
     ensureSavedOutputFds()
     if savedStdoutFd <= 0 or savedStderrFd <= 0:
@@ -324,7 +327,6 @@ else:
   proc appendTestOutput(ctx: AsyncTestContext, output: string) =
     discard
   proc suspendTestOutputCapture() = discard
-  proc resumeTestOutputCapture() = discard
   proc startTestOutputCapture(ctx: AsyncTestContext) = discard
   proc finishTestOutputCapture(ctx: AsyncTestContext): string = ""
 
@@ -353,43 +355,13 @@ template installChroniclesTestOutput() {.dirty.} =
 
 proc noteTestExecution(suiteName, testName: string) {.gcsafe.}
 
-template await*[T](f: Future[T]): T =
-  let unittest3AwaitCtx = currentAsyncCtx
-  suspendTestOutputCapture()
-  when T is void:
-    chronos.await(f)
-    {.cast(gcsafe).}:
-      currentAsyncCtx = unittest3AwaitCtx
-    if unittest3AwaitCtx != nil:
-      noteTestExecution(unittest3AwaitCtx.suiteName, unittest3AwaitCtx.testName)
-    resumeTestOutputCapture()
+proc unittest3TaskLocalContextSwitched(ctx: TaskLocalContext) {.gcsafe, raises: [].} =
+  if ctx != nil and ctx of AsyncTestContext:
+    let asyncCtx = AsyncTestContext(ctx)
+    noteTestExecution(asyncCtx.suiteName, asyncCtx.testName)
+    activateStdoutCapture(asyncCtx)
   else:
-    let unittest3AwaitResult = chronos.await(f)
-    {.cast(gcsafe).}:
-      currentAsyncCtx = unittest3AwaitCtx
-    if unittest3AwaitCtx != nil:
-      noteTestExecution(unittest3AwaitCtx.suiteName, unittest3AwaitCtx.testName)
-    resumeTestOutputCapture()
-    unittest3AwaitResult
-
-template await*[T, E](f: InternalRaisesFuture[T, E]): T =
-  let unittest3AwaitCtx = currentAsyncCtx
-  suspendTestOutputCapture()
-  when T is void:
-    chronos.await(f)
-    {.cast(gcsafe).}:
-      currentAsyncCtx = unittest3AwaitCtx
-    if unittest3AwaitCtx != nil:
-      noteTestExecution(unittest3AwaitCtx.suiteName, unittest3AwaitCtx.testName)
-    resumeTestOutputCapture()
-  else:
-    let unittest3AwaitResult = chronos.await(f)
-    {.cast(gcsafe).}:
-      currentAsyncCtx = unittest3AwaitCtx
-    if unittest3AwaitCtx != nil:
-      noteTestExecution(unittest3AwaitCtx.suiteName, unittest3AwaitCtx.testName)
-    resumeTestOutputCapture()
-    unittest3AwaitResult
+    suspendTestOutputCapture()
 
 when collect:
   var
@@ -1292,7 +1264,8 @@ template runtimeTest*(nameParam: string, body: untyped) =
       status: TestStatus.OK,
       checkpoints: @[])
     {.cast(gcsafe).}:
-      currentAsyncCtx = ctx
+      discard setTaskLocalContextSwitchCallback(unittest3TaskLocalContextSwitched)
+      discard setCurrentTaskLocalContext(ctx)
       startTestOutputCapture(ctx)
       installChroniclesTestOutput()
 
@@ -1328,7 +1301,7 @@ template runtimeTest*(nameParam: string, body: untyped) =
           when declared(testTeardownIMPLFlag): testTeardownIMPL()
 
       let output = finishTestOutputCapture(ctx)
-      currentAsyncCtx = nil
+      discard setCurrentTaskLocalContext(nil)
     TestRunResult(status: ctx.status, output: output)
 
   let

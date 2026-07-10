@@ -3,7 +3,7 @@ let lang = getEnv("NIMLANG", "c") # Which backend (c/cpp/js)
 let flags = getEnv("NIMFLAGS", "") # Extra flags for the compiler
 let verbose = getEnv("V", "") notin ["", "0"]
 
-from os import quoteShell
+from os import quoteShell, `/`
 
 let cfg =
   " --styleCheck:usages --styleCheck:error" &
@@ -52,3 +52,14 @@ task buildDocs, "Build docs":
 when withDir(thisDir(), system.fileExists("nimble.paths")):
   include "nimble.paths"
 # end Nimble config
+
+let
+  localChronosPath = thisDir() / ".." / "nim-chronos"
+  oldVendoredChronosPath = thisDir() / "nimbledeps" / "pkgs2" /
+    "chronos-4.2.2-3a4c9477df8cef20a04e4f1b54a2d74fdfc2a3d0"
+
+if dirExists(oldVendoredChronosPath):
+  switch("excludePath", oldVendoredChronosPath)
+
+if dirExists(localChronosPath):
+  switch("path", localChronosPath)

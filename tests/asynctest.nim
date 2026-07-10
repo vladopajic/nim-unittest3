@@ -54,6 +54,31 @@ suite "Async Expected Failure":
     check output.contains("[FAILED ]")
     check output.contains("check false")
 
+  test "chronos-only helper await keeps unittest3 context":
+    let childPath = "build" / "async_chronos_helper_context.nim"
+    createDir childPath.splitFile.dir
+    writeFile(childPath, """
+import ../unittest3
+import ../tests/chronos_only_helper
+
+suite "Async Chronos Helper Context":
+  test "callback failure after helper await fails this test":
+    await callAfterNormalChronosAwait(proc() {.gcsafe, raises: [].} =
+      checkpoint("helper callback after normal chronos await")
+      check false
+    )
+""")
+
+    let (output, exitCode) = execCmdEx(
+      "nim c --threads:on -r " & quoteShell(childPath) &
+      " --output-level=COMPACT"
+    )
+
+    check exitCode == 0
+    check output.contains("[FAILED ]")
+    check output.contains("helper callback after normal chronos await")
+    check output.contains("Check failed: false")
+
   test "slow async child test fails on timeout":
     let childPath = "build" / "async_expected_timeout.nim"
     createDir childPath.splitFile.dir
